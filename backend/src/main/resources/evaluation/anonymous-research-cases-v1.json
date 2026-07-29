@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "anonymous-research-cases/v1",
+  "dataClassification": "SYNTHETIC_ANONYMOUS",
+  "cases": [
+    {
+      "id": "SYN-001",
+      "idea": "拟研究2型糖尿病成年患者使用SGLT2抑制剂与一年内肾功能变化的关联，数据来源和对照定义待确认。",
+      "expectedKeywords": ["糖尿病", "肾功能"],
+      "expectedStudyTypes": ["CROSS_SECTIONAL", "COHORT", "CASE_CONTROL"],
+      "minimumClarificationQuestions": 3
+    },
+    {
+      "id": "SYN-002",
+      "idea": "拟利用匿名电子病历研究高血压患者长期高盐饮食暴露与脑卒中发生的关联，观察时间与混杂因素待确认。",
+      "expectedKeywords": ["高血压", "卒中"],
+      "expectedStudyTypes": ["CROSS_SECTIONAL", "COHORT", "CASE_CONTROL"],
+      "minimumClarificationQuestions": 3
+    },
+    {
+      "id": "SYN-003",
+      "idea": "拟研究慢性阻塞性肺疾病患者吸入治疗依从性与急性加重的关联，结局操作性定义和数据场景待确认。",
+      "expectedKeywords": ["慢性阻塞性肺疾病", "急性加重"],
+      "expectedStudyTypes": ["CROSS_SECTIONAL", "COHORT", "CASE_CONTROL"],
+      "minimumClarificationQuestions": 3
+    },
+    {
+      "id": "SYN-004",
+      "idea": "拟研究乳腺癌术后人群康复训练暴露与上肢淋巴水肿的关联，对照组和随访时间待确认。",
+      "expectedKeywords": ["乳腺癌", "淋巴水肿"],
+      "expectedStudyTypes": ["CROSS_SECTIONAL", "COHORT", "CASE_CONTROL"],
+      "minimumClarificationQuestions": 3
+    },
+    {
+      "id": "SYN-005",
+      "idea": "拟研究老年住院人群多重用药暴露与跌倒事件的关联，药物数量阈值、病例来源和观察窗口待确认。",
+      "expectedKeywords": ["老年", "跌倒"],
+      "expectedStudyTypes": ["CROSS_SECTIONAL", "COHORT", "CASE_CONTROL"],
+      "minimumClarificationQuestions": 3
+    }
+  ]
+}

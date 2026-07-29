@@ -1,0 +1,48 @@
+{
+  "schemaVersion": "observational-study-rules/v1",
+  "unresolvedValueMarkers": [
+    "待确认",
+    "未暴露或替代暴露组"
+  ],
+  "fields": {
+    "population": {
+      "answerQuestionMarkers": []
+    },
+    "exposure": {
+      "answerQuestionMarkers": ["暴露和对照"]
+    },
+    "comparator": {
+      "answerQuestionMarkers": ["暴露和对照"]
+    },
+    "outcome": {
+      "answerQuestionMarkers": ["主要结局"]
+    },
+    "setting": {
+      "answerQuestionMarkers": ["门诊", "住院", "体检", "数据来源"]
+    },
+    "timeFrame": {
+      "answerQuestionMarkers": ["观察多长", "观察时间", "随访时间"]
+    }
+  },
+  "studyTypes": {
+    "CROSS_SECTIONAL": {
+      "requiredFields": ["population", "outcome", "setting", "timeFrame"],
+      "explanation": "适合描述目标时间窗内的现状及同期相关因素，不能直接作因果推断。"
+    },
+    "COHORT": {
+      "requiredFields": [
+        "population",
+        "exposure",
+        "comparator",
+        "outcome",
+        "setting",
+        "timeFrame"
+      ],
+      "explanation": "适合比较暴露组与对照组随时间发生的结局变化，需要明确时间零点和混杂控制。"
+    },
+    "CASE_CONTROL": {
+      "requiredFields": ["population", "exposure", "comparator", "outcome", "setting"],
+      "explanation": "适合从结局出发比较既往暴露，需要明确病例与对照来源并防范回忆和选择偏倚。"
+    }
+  }
+}

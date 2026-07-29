@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: medical-agent
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 21MB
+  profiles:
+    default: memory
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.security.servlet.UserDetailsServiceAutoConfiguration
+server:
+  port: 8080
+  error:
+    include-message: never
+logging:
+  pattern:
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %-5level [%X{traceId:-no-trace}] %logger{36} - %msg%n"
+springdoc:
+  api-docs:
+    enabled: true
+    path: /v3/api-docs
+  swagger-ui:
+    enabled: true
+    path: /swagger-ui.html
+medical:
+  security:
+    secure-cookie: ${SECURE_COOKIE:false}
+  bootstrap:
+    admin-username: ${BOOTSTRAP_ADMIN_USERNAME:}
+    admin-password: ${BOOTSTRAP_ADMIN_PASSWORD:}
+  model:
+    mode: ${MEDICAL_MODEL_MODE:mock}
+    external-enabled: ${MEDICAL_MODEL_EXTERNAL_ENABLED:false}
+    name: ${MEDICAL_MODEL_NAME:deepseek-v4-flash}
+    base-url: ${MEDICAL_MODEL_BASE_URL:https://api.deepseek.com}
+    api-key: ${MEDICAL_MODEL_API_KEY:}
+    api-key-file: ${MEDICAL_MODEL_API_KEY_FILE:}
+    connect-timeout: ${MEDICAL_MODEL_CONNECT_TIMEOUT:5s}
+    read-timeout: ${MEDICAL_MODEL_READ_TIMEOUT:60s}
+  pubmed:
+    mode: ${PUBMED_MODE:mock}
+    base-url: ${PUBMED_BASE_URL:https://eutils.ncbi.nlm.nih.gov/entrez/eutils}
+    tool: ${PUBMED_TOOL:medical_research_agent}
+    email: ${PUBMED_EMAIL:}
+    api-key: ${PUBMED_API_KEY:}
+    max-results: ${PUBMED_MAX_RESULTS:20}
+    max-attempts: ${PUBMED_MAX_ATTEMPTS:3}
+    connect-timeout: ${PUBMED_CONNECT_TIMEOUT:5s}
+    read-timeout: ${PUBMED_READ_TIMEOUT:30s}
+  clinical-trials:
+    mode: ${CLINICAL_TRIALS_MODE:mock}
+    base-url: ${CLINICAL_TRIALS_BASE_URL:https://clinicaltrials.gov/api/v2}
+    user-agent: ${CLINICAL_TRIALS_USER_AGENT:medical-research-agent/1.0}
+    max-results: ${CLINICAL_TRIALS_MAX_RESULTS:20}
+    max-attempts: ${CLINICAL_TRIALS_MAX_ATTEMPTS:3}
+    cache-ttl: ${CLINICAL_TRIALS_CACHE_TTL:12h}
+    connect-timeout: ${CLINICAL_TRIALS_CONNECT_TIMEOUT:5s}
+    read-timeout: ${CLINICAL_TRIALS_READ_TIMEOUT:30s}
+  crossref:
+    mode: ${CROSSREF_MODE:mock}
+    base-url: ${CROSSREF_BASE_URL:https://api.crossref.org}
+    user-agent: ${CROSSREF_USER_AGENT:medical-research-agent/1.0}
+    mailto: ${CROSSREF_MAILTO:}
+    max-attempts: ${CROSSREF_MAX_ATTEMPTS:3}
+    cache-ttl: ${CROSSREF_CACHE_TTL:24h}
+    connect-timeout: ${CROSSREF_CONNECT_TIMEOUT:5s}
+    read-timeout: ${CROSSREF_READ_TIMEOUT:30s}
+  storage:
+    enabled: ${MINIO_ENABLED:false}
+    endpoint: ${MINIO_ENDPOINT:http://127.0.0.1:9000}
+    access-key: ${MINIO_ACCESS_KEY:}
+    secret-key: ${MINIO_SECRET_KEY:}
+    bucket: ${MINIO_BUCKET:medical-agent-files}
+  file-scan:
+    mode: ${FILE_SCAN_MODE:basic}
+    clamav-host: ${CLAMAV_HOST:127.0.0.1}
+    clamav-port: ${CLAMAV_PORT:3310}
+    timeout: ${CLAMAV_TIMEOUT:5s}
+  agent:
+    worker-delay: ${AGENT_WORKER_DELAY:500}
+    worker-initial-delay: ${AGENT_WORKER_INITIAL_DELAY:1000}
+    lease-duration: ${AGENT_LEASE_DURATION:30s}
+    task-timeout: ${AGENT_TASK_TIMEOUT:15m}
+    sse-timeout: ${AGENT_SSE_TIMEOUT:30m}

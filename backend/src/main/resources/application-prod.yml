@@ -1,0 +1,10 @@
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+medical:
+  security:
+    secure-cookie: true
+  file-scan:
+    mode: clamav
