@@ -25,7 +25,7 @@ if ($listener) {
         Status = 'AlreadyListening'
         Endpoint = "$($listener.LocalAddress):3310"
     }
-    exit 0
+    return
 }
 
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null

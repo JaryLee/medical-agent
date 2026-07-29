@@ -17,6 +17,13 @@ export interface CurrentUser {
   forcePasswordChange: boolean
 }
 
+export interface ModelRuntime {
+  provider: string
+  mode: string
+  modelName: string
+  externalEnabled: boolean
+}
+
 export interface Project {
   id: string
   code: string
@@ -644,6 +651,11 @@ export async function changePassword(currentPassword: string, newPassword: strin
 
 export async function listProjects() {
   const response = await client.get<ApiResponse<Project[]>>('/research/projects')
+  return response.data.data
+}
+
+export async function getModelRuntime() {
+  const response = await client.get<ApiResponse<ModelRuntime>>('/runtime/model')
   return response.data.data
 }
 

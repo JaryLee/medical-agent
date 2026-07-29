@@ -61,6 +61,15 @@ public class MinioObjectStorage implements ObjectStorage {
         }
     }
 
+    @Override
+    public boolean isAvailable() {
+        try {
+            return client.bucketExists(BucketExistsArgs.builder().bucket(bucket).build());
+        } catch (Exception exception) {
+            return false;
+        }
+    }
+
     private void ensureBucket() {
         try {
             boolean exists = client.bucketExists(BucketExistsArgs.builder().bucket(bucket).build());

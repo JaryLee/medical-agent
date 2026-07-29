@@ -15,4 +15,5 @@ public class DisabledObjectStorage implements ObjectStorage {
     @Override public void put(String objectKey, byte[] content, String contentType) { throw disabled(); }
     @Override public byte[] get(String objectKey) { throw disabled(); }
     @Override public void delete(String objectKey) { throw disabled(); }
+    @Override public boolean isAvailable() { return false; }
 }

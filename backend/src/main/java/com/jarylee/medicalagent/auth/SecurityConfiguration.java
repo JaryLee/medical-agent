@@ -11,6 +11,7 @@ import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.security.web.SecurityFilterChain;
 import org.springframework.security.web.authentication.UsernamePasswordAuthenticationFilter;
+import org.springframework.security.web.csrf.CsrfTokenRequestAttributeHandler;
 import org.springframework.security.web.csrf.CookieCsrfTokenRepository;
 
 import java.time.Clock;
@@ -31,12 +32,18 @@ public class SecurityConfiguration {
             throws Exception {
         var csrf = CookieCsrfTokenRepository.withHttpOnlyFalse();
         csrf.setCookieName("XSRF-TOKEN");
+        var csrfRequestHandler = new CsrfTokenRequestAttributeHandler();
         boolean production = environment.acceptsProfiles(Profiles.of("prod"));
         return http
                 .csrf(config -> config.csrfTokenRepository(csrf)
+                        .csrfTokenRequestHandler(csrfRequestHandler)
                         .ignoringRequestMatchers("/api/auth/login"))
                 .authorizeHttpRequests(auth -> {
                     auth.requestMatchers("/api/auth/login").permitAll();
+                    auth.requestMatchers(
+                            "/actuator/health",
+                            "/actuator/health/liveness",
+                            "/actuator/health/readiness").permitAll();
                     if (!production && apiDocsEnabled) {
                         auth.requestMatchers("/v3/api-docs/**").permitAll();
                     }

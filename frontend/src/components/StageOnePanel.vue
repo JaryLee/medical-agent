@@ -16,6 +16,7 @@ import {
   confirmDocumentExport,
   documentExportDownloadUrl,
   getAgentTask,
+  getModelRuntime,
   getDocumentExport,
   getExpertReview,
   installDefaultCitationStyle,
@@ -44,6 +45,7 @@ import {
   type DocumentTemplate,
   type ExpertReview,
   type ExpertReviewCommentType,
+  type ModelRuntime,
   type Project,
   type ProjectMember,
   type ProjectMemberRole,
@@ -101,6 +103,7 @@ const documentExport = ref<DocumentExport>()
 const documentTemplateCode = ref('OBSERVATIONAL_PROTOCOL')
 const documentTemplateName = ref('')
 const documentTemplateFile = ref<File>()
+const modelRuntime = ref<ModelRuntime>()
 const isExpert = computed(() => user.value?.roles.includes('EXPERT') ?? false)
 const isHospitalAdmin = computed(
   () => user.value?.roles.includes('HOSPITAL_ADMIN') ?? false,
@@ -113,7 +116,12 @@ onMounted(async () => {
   const restoredUser = await session.restore()
   if (restoredUser && !restoredUser.forcePasswordChange) {
     projects.value = await listProjects()
-    await Promise.all([refreshDocumentTemplates(), refreshCitationStyles()])
+    const [runtime] = await Promise.all([
+      getModelRuntime(),
+      refreshDocumentTemplates(),
+      refreshCitationStyles(),
+    ])
+    modelRuntime.value = runtime
   }
 })
 
@@ -123,7 +131,12 @@ async function signIn() {
     user.value = await session.signIn(hospitalCode.value, username.value, password.value)
     if (!user.value.forcePasswordChange) {
       projects.value = await listProjects()
-      await Promise.all([refreshDocumentTemplates(), refreshCitationStyles()])
+      const [runtime] = await Promise.all([
+        getModelRuntime(),
+        refreshDocumentTemplates(),
+        refreshCitationStyles(),
+      ])
+      modelRuntime.value = runtime
     }
   } catch {
     ElMessage.error('登录失败或账号已锁定')
@@ -622,6 +635,13 @@ async function refreshAudits() {
         <strong>工程工作台 · 课题与研究 Agent</strong>
         <el-tag type="success">
           医院隔离
+        </el-tag>
+        <el-tag
+          v-if="modelRuntime"
+          :type="modelRuntime.provider === 'deepseek' && modelRuntime.externalEnabled ? 'success' : 'warning'"
+        >
+          模型：{{ modelRuntime.provider }} · {{ modelRuntime.modelName }}
+          {{ modelRuntime.externalEnabled ? '· 真 API' : '· 外部调用关闭' }}
         </el-tag>
       </div>
     </template>

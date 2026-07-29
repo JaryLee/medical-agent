@@ -21,6 +21,7 @@
 
 当前处于阶段 7“安全、评测与部署基线”。阶段 2～6 可编码主链已实现到 STEP18，
 并完成 PostgreSQL、MinIO、ClamAV、LibreOffice 和 DeepSeek 的指定范围实机验证。
+运行健康、本地启停/冒烟、离线一致备份和新目标恢复演练已完成，安全扫描按当前安排暂缓。
 
 | 范围 | 当前状态 |
 | --- | --- |
@@ -29,7 +30,9 @@
 | PostgreSQL / Flyway | V1～V19 已实机迁移，44 张业务表，另有 `flyway_schema_history` |
 | MinIO | 文件、外部工具原始响应、模板和导出文档读写闭环已验证 |
 | ClamAV | 1.5.3 实机接入；安全文件、EICAR 和失败关闭路径已验证 |
-| DeepSeek | 技术接入及匿名结构化输出已验证；生产数据审批未完成 |
+| 运行健康 | Actuator 最小暴露；PostgreSQL、MinIO、ClamAV 深度检查和本地冒烟已通过 |
+| 备份恢复 | PostgreSQL custom archive + MinIO mirror + SHA-256 manifest；临时恢复演练已通过 |
+| DeepSeek | 当前本地运行脚本已接入真实 API；Java 契约与 STEP01→STEP07 浏览器链路通过，生产数据审批未完成 |
 | PubMed | 适配器和协议测试已完成；本机缺少已注册的 `PUBMED_EMAIL`，真实联机测试待执行 |
 | ClinicalTrials.gov / Crossref | 真实 API 适配器已实现并完成指定联机验证 |
 | DOCX | 受控模板 v2、两套合成模板、STEP18 导出和 LibreOffice 视觉检查已完成 |
@@ -102,7 +105,8 @@ flowchart LR
 
 ### 外部模型安全
 
-- 默认 `MEDICAL_MODEL_MODE=mock`，不会调用外部大模型。
+- 配置文件的保守默认值仍为 `mock`，仅服务于无外部调用的确定性测试；当前 Windows 本地启动
+  脚本强制使用 `deepseek`，运行实例不设置 Mock 回退。
 - DeepSeek 只有在同时设置 `mode=deepseek` 和
   `MEDICAL_MODEL_EXTERNAL_ENABLED=true` 时才允许初始化。
 - 密钥只从服务端环境变量或密钥文件读取，前端不能指定供应商、模型名、Base URL 或密钥。
@@ -280,10 +284,20 @@ npm run dev
 
 Set-Location frontend
 npm run dev
+
+# 回到仓库根目录后检查全部本地服务并执行安全冒烟。
+Set-Location ..
+.\tools\status-local.ps1
+.\tools\smoke-local.ps1
+
+# 只安全停止本项目后端，不影响 PostgreSQL、MinIO、ClamAV 或前端。
+.\tools\stop-local-backend.ps1
 ```
 
-`start-local-backend.ps1` 会从本机 DPAPI 凭据文件读取 MinIO 密钥，不会把明文写入仓库或命令。
-该脚本只适用于当前 Windows 开发机，不是通用生产启动器。
+`start-local-backend.ps1` 会从本机 DPAPI 凭据文件读取 MinIO 密钥，并从未跟踪的
+`deepseek_token.txt` 读取真实 DeepSeek 凭证，不会把明文写入仓库或命令。令牌缺失或为空时
+启动失败。它会校验 8080 端口归属、等待 ClamAV，并在后端总健康为 `UP` 后成功返回。停服脚本
+也会先校验监听进程确为本项目 JAR。上述脚本只适用于当前 Windows 开发机，不是通用生产启动器。
 
 ### 方式三：用 Docker Compose 启动中间件
 
@@ -352,6 +366,18 @@ mvn -Dtest=ClamAvMalwareScannerTest test
 | DeepSeek 对照评测 | `RUN_DEEPSEEK_EVALUATION=true` |
 
 外部模型测试只允许使用匿名、虚构或公开数据。
+
+### 真实 DeepSeek 完整测试
+
+```powershell
+Set-Location D:\develop\AIWorkspace\MEDICAL_AGENT
+.\tools\test-deepseek-live.ps1
+```
+
+脚本依次执行后端全量回归、真实 Java API 契约、前端 lint/typecheck/Vitest/build，并在隔离的
+18080/4174 环境运行 Playwright。当前结果为 PASS：94 个后端测试中 82 通过、12 个环境条件
+跳过；Playwright 1/1 在 30.2 秒内真实完成 STEP01→STEP07，运行 Provider 为 `deepseek`，
+Mock 回退关闭。详见[测试方案与执行记录](doc/测试/真实DeepSeek-API接入测试方案.md)。
 
 ## 前端构建与测试
 
@@ -560,14 +586,26 @@ $env:CROSSREF_MAILTO='registered-contact@example.org'
 
 仅非 `prod` 环境按配置开放。
 
+### 健康检查
+
+| 方法 | 路径 | 语义 |
+| --- | --- | --- |
+| GET | `/actuator/health` | 深度检查；聚合应用、PostgreSQL、对象存储及启用时的 ClamAV |
+| GET | `/actuator/health/liveness` | Spring 应用进程存活状态 |
+| GET | `/actuator/health/readiness` | Spring 应用接收请求的进程状态 |
+
+三个端点允许匿名读取，但只返回 `{"status":"UP"}` 或 `{"status":"DOWN"}`，不返回组件名、
+地址、凭据或异常。只有 `health` 被 Actuator 暴露，`env` 等管理端点不开放。部署流量切换和
+本机完整依赖验收应使用总健康 `/actuator/health`；存活探针不应用来判断外部依赖是否可用。
+
 ## 18 步工作流
 
 | 步骤 | 名称 | 执行方式 | 主要结果或门禁 |
 | --- | --- | --- | --- |
-| STEP01 | `PARSE_IDEA` | 模型/Mock | 结构化研究要素 |
+| STEP01 | `PARSE_IDEA` | 模型（当前运行：DeepSeek） | 结构化研究要素 |
 | STEP02 | `IDENTIFY_MISSING_INFORMATION` | 确定性 | 缺失字段 |
 | STEP03 | `ASK_CLARIFICATION` | 人工 | 全部问题回答后继续，保留轮次历史 |
-| STEP04 | `GENERATE_RESEARCH_DIRECTIONS` | 模型/Mock | 恰好三个观察性研究方向 |
+| STEP04 | `GENERATE_RESEARCH_DIRECTIONS` | 模型（当前运行：DeepSeek） | 恰好三个观察性研究方向 |
 | STEP05 | `CONFIRM_DIRECTION` | 人工 | 选择方向，或修订答案重新生成 |
 | STEP06 | `BUILD_RESEARCH_QUESTION` | 确定性 | PECO 与规则评估 |
 | STEP07 | `BUILD_SEARCH_STRATEGY` | 确定性 + 人工 | 版本化检索式，确认前不检索 |
@@ -625,8 +663,49 @@ hospital/{hospitalId}/projects/{projectId}/exports/{exportId}/{fileName}
 - 外部请求 WireMock 合约测试。
 - ClamAV、PostgreSQL、MinIO 和外部 API 条件式实机测试。
 - LibreOffice 逐页视觉渲染验收产物。
+- 94 个后端默认测试：82 个通过、12 个条件式环境测试跳过、0 失败。
 
 ## 运维检查
+
+### 一键状态与冒烟
+
+```powershell
+# 检查前端、后端、PostgreSQL、MinIO 和 ClamAV；任一 DOWN 返回非零退出码。
+.\tools\status-local.ps1
+
+# 检查深度健康、响应脱敏、进程探针、开发文档、匿名访问保护、MinIO 和 ClamAV。
+.\tools\smoke-local.ps1
+```
+
+`status-local.ps1 -NoFail` 可用于只展示状态而不让调用脚本失败。脚本不会显示数据库密码、
+MinIO 密钥或模型令牌。
+
+### 备份、校验与恢复演练
+
+跨 PostgreSQL 与 MinIO 没有分布式快照，因此默认采用短暂停写的一致恢复点：
+
+```powershell
+# 1. 暂停应用写入。
+.\tools\stop-local-backend.ps1
+
+# 2. 创建并校验当前数据库和应用桶恢复点。
+$backup = .\tools\backup-local.ps1 -Label recovery-point
+.\tools\verify-local-backup.ps1 -BackupDirectory $backup.Directory
+
+# 3. 重新启动并验收。
+.\tools\start-local-backend.ps1
+.\tools\smoke-local.ps1
+```
+
+完整恢复演练同样要求后端停止，只恢复到随机的新数据库和新桶，结束后自动清理临时目标：
+
+```powershell
+.\tools\exercise-backup-restore.ps1
+```
+
+恢复脚本拒绝覆盖现有目标，只接受 `medical_agent_restore_*` 数据库和
+`medical-agent-restore-*` 存储桶。详细流程、故障处理和生产差距见
+[本地备份恢复运维手册](doc/运维/本地备份恢复运维手册.md)。
 
 ### 监听端口
 
@@ -675,7 +754,8 @@ artifacts/runtime/clamd.err.log
 ## 安全使用原则
 
 1. 只输入匿名、虚构或经医院正式脱敏的数据。
-2. 未完成生产审批前保持所有外部模型和外部检索器为 `mock`。
+2. 未完成生产审批前不得向外部模型发送真实患者或医院敏感数据；当前真实 DeepSeek 仅限
+   `SYNTHETIC_ANONYMOUS` 开发测试，生产流量保持关闭。
 3. 不在仓库、命令行历史、截图、日志或文档中保存密钥。
 4. 生产环境必须使用 `postgres,prod`、HTTPS/HSTS、ClamAV 和最小权限数据库角色。
 5. 医学、统计和合规结论必须由具备资质的人员复核，系统输出不能替代专家判断。

@@ -48,6 +48,14 @@ class AuthenticationHttpTest {
         Cookie session = login.getResponse().getCookie(SessionAuthenticationFilter.COOKIE_NAME);
         assertThat(session).isNotNull();
 
+        mvc.perform(get("/api/runtime/model").cookie(session))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.provider").value("mock"))
+                .andExpect(jsonPath("$.data.mode").value("mock"))
+                .andExpect(jsonPath("$.data.externalEnabled").value(false))
+                .andExpect(jsonPath("$.data.apiKey").doesNotExist())
+                .andExpect(jsonPath("$.data.apiKeyFile").doesNotExist());
+
         mvc.perform(post("/api/prototype/ideas/analyze")
                         .cookie(session)
                         .contentType(MediaType.APPLICATION_JSON)
