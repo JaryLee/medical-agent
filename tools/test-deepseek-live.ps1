@@ -10,17 +10,39 @@ $frontendDirectory = Join-Path $workspace 'frontend'
 $maven = 'D:\develop\environment\apache-maven-3.9.11\bin\mvn.cmd'
 $pom = Join-Path $backendDirectory 'pom.xml'
 $java = 'D:\develop\jdk21\bin\java.exe'
-$jar = Join-Path $backendDirectory 'target\medical-agent-0.1.0-SNAPSHOT.jar'
+$testArtifactName = 'medical-agent-deepseek-live'
+$jar = Join-Path $backendDirectory "target\$testArtifactName.jar"
 $logDirectory = Join-Path $workspace 'artifacts\runtime'
 $backendProcess = $null
+$testEnvironment = @(
+    'DEEPSEEK_TOKEN_FILE',
+    'MEDICAL_MODEL_API_KEY_FILE',
+    'MEDICAL_MODEL_API_KEY',
+    'BOOTSTRAP_ADMIN_USERNAME',
+    'BOOTSTRAP_ADMIN_PASSWORD',
+    'RUN_DEEPSEEK_LIVE_TEST',
+    'DEEPSEEK_E2E',
+    'DEEPSEEK_E2E_ADMIN_USERNAME',
+    'DEEPSEEK_E2E_ADMIN_INITIAL_PASSWORD',
+    'DEEPSEEK_E2E_ADMIN_CHANGED_PASSWORD',
+    'DEEPSEEK_E2E_DOCTOR_USERNAME',
+    'DEEPSEEK_E2E_DOCTOR_INITIAL_PASSWORD',
+    'DEEPSEEK_E2E_DOCTOR_CHANGED_PASSWORD'
+)
+$originalEnvironment = @{}
 
 foreach ($required in @($maven, $java, $TokenFile)) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required DeepSeek test dependency is missing: $required"
     }
 }
-if ((Get-Item -LiteralPath $TokenFile).Length -eq 0) {
+if ([string]::IsNullOrWhiteSpace([System.IO.File]::ReadAllText($TokenFile))) {
     throw 'DeepSeek token file is empty'
+}
+foreach ($command in @('npm.cmd', 'npx.cmd')) {
+    if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+        throw "Required DeepSeek test command is missing: $command"
+    }
 }
 foreach ($port in @(18080, 4174)) {
     if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) {
@@ -29,6 +51,10 @@ foreach ($port in @(18080, 4174)) {
 }
 
 New-Item -ItemType Directory -Force -Path $logDirectory | Out-Null
+foreach ($name in $testEnvironment) {
+    $current = Get-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+    $originalEnvironment[$name] = if ($current) { $current.Value } else { $null }
+}
 $env:DEEPSEEK_TOKEN_FILE = $TokenFile
 $env:MEDICAL_MODEL_API_KEY_FILE = $TokenFile
 $env:MEDICAL_MODEL_API_KEY = ''
@@ -48,10 +74,19 @@ try {
     }
 
     Write-Host '[3/7] Backend package'
-    & $maven -f $pom package -DskipTests
+    & $maven -f $pom package -DskipTests "-Dmedical.build.final-name=$testArtifactName"
     if ($LASTEXITCODE -ne 0) { throw 'Backend package failed' }
 
     Write-Host '[4/7] Start isolated DeepSeek backend on 18080'
+    $credentialNonce = [Guid]::NewGuid().ToString('N')
+    $env:DEEPSEEK_E2E_ADMIN_USERNAME = 'deepseek-platform-admin'
+    $env:DEEPSEEK_E2E_ADMIN_INITIAL_PASSWORD = "DsAdmin1a$($credentialNonce.Substring(0, 12))"
+    $env:DEEPSEEK_E2E_ADMIN_CHANGED_PASSWORD = "DsAdmin2b$($credentialNonce.Substring(12, 12))"
+    $env:DEEPSEEK_E2E_DOCTOR_USERNAME = 'deepseek-doctor'
+    $env:DEEPSEEK_E2E_DOCTOR_INITIAL_PASSWORD = "DsDoctor1a$($credentialNonce.Substring(4, 12))"
+    $env:DEEPSEEK_E2E_DOCTOR_CHANGED_PASSWORD = "DsDoctor2b$($credentialNonce.Substring(16, 12))"
+    $env:BOOTSTRAP_ADMIN_USERNAME = $env:DEEPSEEK_E2E_ADMIN_USERNAME
+    $env:BOOTSTRAP_ADMIN_PASSWORD = $env:DEEPSEEK_E2E_ADMIN_INITIAL_PASSWORD
     $arguments = @(
         '-jar'
         $jar
@@ -61,8 +96,6 @@ try {
         '--medical.model.external-enabled=true'
         '--medical.model.name=deepseek-v4-flash'
         "--medical.model.api-key-file=$TokenFile"
-        '--medical.bootstrap.admin-username=deepseek-platform-admin'
-        '--medical.bootstrap.admin-password=DeepSeekAdmin123'
         '--medical.agent.worker-delay=500'
         '--medical.agent.worker-initial-delay=500'
         '--medical.file-scan.mode=basic'
@@ -139,7 +172,12 @@ try {
             [void]$backendProcess.WaitForExit(15000)
         }
     }
-    Remove-Item Env:DEEPSEEK_TOKEN_FILE -ErrorAction SilentlyContinue
-    Remove-Item Env:MEDICAL_MODEL_API_KEY_FILE -ErrorAction SilentlyContinue
-    Remove-Item Env:MEDICAL_MODEL_API_KEY -ErrorAction SilentlyContinue
+    foreach ($name in $testEnvironment) {
+        $value = $originalEnvironment[$name]
+        if ($null -eq $value) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+        } else {
+            Set-Item -LiteralPath "Env:$name" -Value $value
+        }
+    }
 }

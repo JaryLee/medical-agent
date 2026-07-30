@@ -1,11 +1,10 @@
 import { expect, test, type Page } from '@playwright/test'
 
-const bootstrapUsername = 'deepseek-platform-admin'
-const bootstrapPassword = 'DeepSeekAdmin123'
-const changedAdminPassword = 'DeepSeekAdmin456'
-const doctorUsername = 'deepseek-doctor'
-const initialDoctorPassword = 'DeepSeekDoctor123'
-const changedDoctorPassword = 'DeepSeekDoctor456'
+function requiredSetting(name: string) {
+  const value = process.env[name]
+  if (!value) throw new Error(`Required live E2E setting is missing: ${name}`)
+  return value
+}
 
 async function login(page: Page, hospitalCode: string, username: string, password: string) {
   await page.getByLabel('医院编码（平台管理员留空）').fill(hospitalCode)
@@ -63,6 +62,12 @@ test('real DeepSeek drives the authenticated workflow through STEP07 without Moc
 }) => {
   test.skip(process.env.DEEPSEEK_E2E !== 'true', 'Explicit live API opt-in is required')
 
+  const bootstrapUsername = requiredSetting('DEEPSEEK_E2E_ADMIN_USERNAME')
+  const bootstrapPassword = requiredSetting('DEEPSEEK_E2E_ADMIN_INITIAL_PASSWORD')
+  const changedAdminPassword = requiredSetting('DEEPSEEK_E2E_ADMIN_CHANGED_PASSWORD')
+  const doctorUsername = requiredSetting('DEEPSEEK_E2E_DOCTOR_USERNAME')
+  const initialDoctorPassword = requiredSetting('DEEPSEEK_E2E_DOCTOR_INITIAL_PASSWORD')
+  const changedDoctorPassword = requiredSetting('DEEPSEEK_E2E_DOCTOR_CHANGED_PASSWORD')
   const unique = Date.now().toString(36).toUpperCase()
   const hospitalCode = `DS-${unique}`
   const projectCode = `DS-P-${unique}`

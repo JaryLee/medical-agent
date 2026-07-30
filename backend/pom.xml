@@ -25,6 +25,7 @@
         <minio.version>9.0.1</minio.version>
         <springdoc.version>2.8.17</springdoc.version>
         <pdfbox.version>3.0.8</pdfbox.version>
+        <medical.build.final-name>${project.artifactId}-${project.version}</medical.build.final-name>
     </properties>
 
     <dependencyManagement>
@@ -154,6 +155,7 @@
     </dependencies>
 
     <build>
+        <finalName>${medical.build.final-name}</finalName>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
