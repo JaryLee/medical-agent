@@ -6,11 +6,14 @@ test('医生可复核修订并确认版本化 PubMed 检索策略', async ({ pag
   let confirmedQuery = ''
   let reviewStatus = 'WAITING_EXPERT_REVIEW'
   let reviewVersion = 0
+  let medicalApproved = false
+  let statisticalApproved = false
   let exportCompleted = false
   const reviewComments: Array<Record<string, unknown>> = []
   const reviewHistory: Array<Record<string, unknown>> = [{
     id: 'review-action-opened',
     actionType: 'REVIEW_OPENED',
+    reviewRoundNo: 1,
     actorUserId: 'user-1',
     summary: 'STEP16 完成，已提交专家审核。',
     occurredAt: '2026-07-28T01:10:00Z',
@@ -330,15 +333,18 @@ test('医生可复核修订并确认版本化 PubMed 检索策略', async ({ pag
     protocolId: 'protocol-1',
     strobeCheckTaskId: 'strobe-check-1',
     status: reviewStatus,
+    reviewRoundNo: 1,
     submittedBy: 'user-1',
     submittedAt: '2026-07-28T01:10:00Z',
-    expertReviewerId: reviewStatus === 'WAITING_EXPERT_REVIEW' ? undefined : 'user-1',
-    expertDecision: reviewStatus === 'WAITING_EXPERT_REVIEW' ? undefined : 'APPROVE',
-    expertSummary: reviewStatus === 'WAITING_EXPERT_REVIEW'
-      ? undefined : '可进入课题负责人确认。',
-    expertDecidedAt: reviewStatus === 'WAITING_EXPERT_REVIEW'
-      ? undefined : '2026-07-28T01:12:00Z',
-    ownerConfirmedBy: reviewStatus === 'APPROVED' ? 'user-1' : undefined,
+    expertReviewerId: medicalApproved ? 'medical-user' : undefined,
+    expertDecision: medicalApproved ? 'APPROVE' : undefined,
+    expertSummary: medicalApproved ? '医学审核通过。' : undefined,
+    expertDecidedAt: medicalApproved ? '2026-07-28T01:12:00Z' : undefined,
+    statisticalReviewerId: statisticalApproved ? 'statistical-user' : undefined,
+    statisticalDecision: statisticalApproved ? 'APPROVE' : undefined,
+    statisticalSummary: statisticalApproved ? '统计审核通过。' : undefined,
+    statisticalDecidedAt: statisticalApproved ? '2026-07-28T01:12:30Z' : undefined,
+    ownerConfirmedBy: reviewStatus === 'APPROVED' ? 'owner-user' : undefined,
     ownerConfirmedAt: reviewStatus === 'APPROVED' ? '2026-07-28T01:13:00Z' : undefined,
     sectionsLocked: reviewStatus === 'APPROVED',
     version: reviewVersion,
@@ -756,17 +762,20 @@ test('医生可复核修订并确认版本化 PubMed 检索策略', async ({ pag
         protocolSectionId: string
         protocolSectionVersionNo: number
         commentType: string
+        responsibility: string
         content: string
       }
       reviewComments.push({
         id: 'review-comment-1',
         ...payload,
+        reviewRoundNo: 1,
         createdBy: 'user-1',
         createdAt: '2026-07-28T01:11:00Z',
       })
       reviewHistory.push({
         id: 'review-action-comment',
         actionType: 'COMMENT_ADDED',
+        reviewRoundNo: 1,
         actorUserId: 'user-1',
         summary: `${payload.commentType} 批注`,
         occurredAt: '2026-07-28T01:11:00Z',
@@ -777,17 +786,29 @@ test('医生可复核修订并确认版本化 PubMed 检索策略', async ({ pag
     if (path === '/api/agent/tasks/task-search-1/expert-review/decision') {
       const payload = request.postDataJSON() as {
         decision: string
+        responsibility: string
         summary: string
         expectedVersion: number
       }
       expect(payload.decision).toBe('APPROVE')
-      expect(payload.expectedVersion).toBe(0)
-      reviewStatus = 'EXPERT_APPROVED'
-      reviewVersion = 1
+      if (payload.responsibility === 'MEDICAL_REVIEW') {
+        expect(payload.expectedVersion).toBe(0)
+        medicalApproved = true
+        reviewVersion = 1
+      } else {
+        expect(payload.responsibility).toBe('STATISTICAL_REVIEW')
+        expect(payload.expectedVersion).toBe(1)
+        statisticalApproved = true
+        reviewStatus = 'EXPERT_APPROVED'
+        reviewVersion = 2
+      }
       reviewHistory.push({
-        id: 'review-action-approved',
-        actionType: 'EXPERT_APPROVED',
-        actorUserId: 'user-1',
+        id: `review-action-${payload.responsibility}`,
+        actionType: payload.responsibility === 'MEDICAL_REVIEW'
+          ? 'MEDICAL_REVIEW_APPROVED' : 'STATISTICAL_REVIEW_APPROVED',
+        reviewRoundNo: 1,
+        actorUserId: payload.responsibility === 'MEDICAL_REVIEW'
+          ? 'medical-user' : 'statistical-user',
         summary: payload.summary,
         occurredAt: '2026-07-28T01:12:00Z',
       })
@@ -796,13 +817,14 @@ test('医生可复核修订并确认版本化 PubMed 检索策略', async ({ pag
     }
     if (path === '/api/agent/tasks/task-search-1/expert-review/owner-confirmation') {
       const payload = request.postDataJSON() as { expectedVersion: number }
-      expect(payload.expectedVersion).toBe(1)
+      expect(payload.expectedVersion).toBe(2)
       reviewStatus = 'APPROVED'
-      reviewVersion = 2
+      reviewVersion = 3
       reviewHistory.push({
         id: 'review-action-owner',
         actionType: 'OWNER_CONFIRMED',
-        actorUserId: 'user-1',
+        reviewRoundNo: 1,
+        actorUserId: 'owner-user',
         summary: '课题负责人确认专家审核结论并锁定当前章节版本。',
         occurredAt: '2026-07-28T01:13:00Z',
       })
@@ -915,19 +937,26 @@ test('医生可复核修订并确认版本化 PubMed 检索策略', async ({ pag
   await expect(page.getByRole('link', { name: 'STROBE 官方检查表' }))
     .toHaveAttribute('href', 'https://www.strobe-statement.org/checklists/')
   await expect(page.getByText('STEP17 专家审核工作台')).toBeVisible()
-  await expect(page.getByText(/审核结论由有权限的专家作出/)).toBeVisible()
+  await expect(page.getByText(/必须由三个不同账号完成/)).toBeVisible()
   await page.getByPlaceholder('写明具体问题、修改要求和确认依据')
     .fill('请核对研究背景引用和统计分析章节。')
-  await page.getByRole('button', { name: '保存专家批注' }).click()
+  await page.getByRole('button', { name: '保存医学审核批注' }).click()
   await expect(page.getByText('请核对研究背景引用和统计分析章节。')).toBeVisible()
   await page.getByPlaceholder('填写审核总结；退回修改前至少需要一条定位批注')
-    .fill('当前版本可进入课题负责人确认。')
-  await page.getByRole('button', { name: '专家审核通过' }).click()
+    .fill('医学审核通过。')
+  await page.getByRole('button', { name: '医学审核通过' }).click()
+  await expect(page.getByText('医学审核通过。').first()).toBeVisible()
+  await page.getByRole('combobox', { name: '审核职责' }).click({ force: true })
+  await page.getByRole('option', { name: '统计审核' }).click()
+  await page.getByPlaceholder('填写审核总结；退回修改前至少需要一条定位批注')
+    .fill('统计审核通过。')
+  await page.getByRole('button', { name: '统计审核通过' }).click()
+  await expect(page.getByText('统计审核通过。').first()).toBeVisible()
   await expect(page.getByRole('button', { name: '课题负责人确认并锁定当前章节版本' }))
     .toBeVisible()
   await page.getByRole('button', { name: '课题负责人确认并锁定当前章节版本' }).click()
   await expect(page.getByText('APPROVED', { exact: true })).toBeVisible()
-  await expect(page.getByText('OWNER_CONFIRMED', { exact: true })).toBeVisible()
+  await expect(page.getByText(/OWNER_CONFIRMED/)).toBeVisible()
   await expect(page.getByText('STEP18 受控 Word 导出')).toBeVisible()
   await expect(page.getByText('正式可用')).toHaveCount(2)
   await page.getByText(

@@ -36,6 +36,8 @@ springdoc:
     enabled: true
     path: /swagger-ui.html
 medical:
+  prototype:
+    enabled: ${MEDICAL_PROTOTYPE_API_ENABLED:false}
   security:
     secure-cookie: ${SECURE_COOKIE:false}
   bootstrap:
@@ -44,6 +46,10 @@ medical:
   model:
     mode: ${MEDICAL_MODEL_MODE:mock}
     external-enabled: ${MEDICAL_MODEL_EXTERNAL_ENABLED:false}
+    route-policy-version: ${MEDICAL_MODEL_ROUTE_POLICY_VERSION:multi-route-policy/v1}
+    allow-insecure-http: ${MEDICAL_MODEL_ALLOW_INSECURE_HTTP:false}
+    max-call-cost-micros: ${MEDICAL_MODEL_MAX_CALL_COST_MICROS:250000}
+    max-project-cost-micros: ${MEDICAL_MODEL_MAX_PROJECT_COST_MICROS:5000000}
     name: ${MEDICAL_MODEL_NAME:deepseek-v4-flash}
     base-url: ${MEDICAL_MODEL_BASE_URL:https://api.deepseek.com}
     api-key: ${MEDICAL_MODEL_API_KEY:}
@@ -92,6 +98,10 @@ medical:
   agent:
     worker-delay: ${AGENT_WORKER_DELAY:500}
     worker-initial-delay: ${AGENT_WORKER_INITIAL_DELAY:1000}
-    lease-duration: ${AGENT_LEASE_DURATION:30s}
+    lease-duration: ${AGENT_LEASE_DURATION:45s}
+    heartbeat-interval: ${AGENT_HEARTBEAT_INTERVAL:10s}
+    model-audit-retention-cleanup-enabled: ${MODEL_AUDIT_RETENTION_CLEANUP_ENABLED:true}
+    model-audit-retention-cleanup-delay: ${MODEL_AUDIT_RETENTION_CLEANUP_DELAY:PT24H}
+    model-audit-retention-cleanup-initial-delay: ${MODEL_AUDIT_RETENTION_CLEANUP_INITIAL_DELAY:PT60S}
     task-timeout: ${AGENT_TASK_TIMEOUT:15m}
     sse-timeout: ${AGENT_SSE_TIMEOUT:30m}

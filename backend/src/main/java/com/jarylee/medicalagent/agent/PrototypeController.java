@@ -3,6 +3,7 @@ package com.jarylee.medicalagent.agent;
 import com.jarylee.medicalagent.agent.model.ResearchModels.*;
 import com.jarylee.medicalagent.common.ApiResponse;
 import jakarta.validation.Valid;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -14,6 +15,8 @@ import java.nio.charset.StandardCharsets;
 
 @RestController
 @RequestMapping("/api/prototype")
+@ConditionalOnProperty(
+        prefix = "medical.prototype", name = "enabled", havingValue = "true")
 public class PrototypeController {
     private final PrototypeService service;
 

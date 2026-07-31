@@ -78,7 +78,7 @@ class AgentWorkflowHttpTest {
                 .andReturn().getResponse().getContentAsString();
         UUID taskId = UUID.fromString(json.readTree(taskBody).at("/data/id").asText());
 
-        mvc.perform(get("/api/research/projects/{id}", projectId).cookie(cookieB))
+        mvc.perform(get("/api/research/projects/legacy/{id}", projectId).cookie(cookieB))
                 .andExpect(status().isNotFound());
         mvc.perform(get("/api/agent/tasks/{id}", taskId).cookie(cookieB))
                 .andExpect(status().isNotFound());
@@ -104,6 +104,7 @@ class AgentWorkflowHttpTest {
         UUID viewerId = UUID.randomUUID();
         UUID outsiderId = UUID.randomUUID();
         UUID expertId = UUID.randomUUID();
+        UUID medicalExpertId = UUID.randomUUID();
         String hospitalCode = "HTTP-" + hospitalId.toString().substring(0, 8);
         String password = "InitialPass123";
         identities.insertHospital(new IdentityRepository.HospitalData(
@@ -113,11 +114,16 @@ class AgentWorkflowHttpTest {
         identities.insertUser(user(outsiderId, hospitalId, "outsider-" + outsiderId, password));
         identities.insertUser(user(
                 expertId, hospitalId, "expert-" + expertId, password, Set.of(Role.EXPERT)));
+        identities.insertUser(user(
+                medicalExpertId, hospitalId, "medical-expert-" + medicalExpertId,
+                password, Set.of(Role.EXPERT)));
 
         Cookie owner = login(hospitalCode, "owner-" + ownerId, password);
         Cookie viewer = login(hospitalCode, "viewer-" + viewerId, password);
         Cookie outsider = login(hospitalCode, "outsider-" + outsiderId, password);
         Cookie expert = login(hospitalCode, "expert-" + expertId, password);
+        Cookie medicalExpert = login(
+                hospitalCode, "medical-expert-" + medicalExpertId, password);
 
         String projectBody = mvc.perform(post("/api/research/projects")
                         .cookie(owner).with(csrf())
@@ -132,6 +138,12 @@ class AgentWorkflowHttpTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(json.writeValueAsString(Map.of(
                                 "userId", viewerId, "role", "VIEWER"))))
+                .andExpect(status().isOk());
+        mvc.perform(post("/api/research/projects/{id}/members", projectId)
+                        .cookie(owner).with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(json.writeValueAsString(Map.of(
+                                "userId", medicalExpertId, "role", "VIEWER"))))
                 .andExpect(status().isOk());
         mvc.perform(post("/api/research/projects/{id}/members", projectId)
                         .cookie(owner).with(csrf())
@@ -190,15 +202,26 @@ class AgentWorkflowHttpTest {
                 .andExpect(jsonPath("$.data[0].answers").isMap());
 
         worker.poll();
+        String directionsBody = mvc.perform(
+                        get("/api/agent/tasks/{id}", taskId).cookie(viewer))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.output.candidateSetId").isString())
+                .andExpect(jsonPath("$.data.output.candidateSetHash").isString())
+                .andReturn().getResponse().getContentAsString();
+        var directionsOutput = json.readTree(directionsBody).at("/data/output");
+        String directionPayload = json.writeValueAsString(Map.of(
+                "directionId", "DIR-02",
+                "candidateSetId", directionsOutput.path("candidateSetId").asText(),
+                "candidateSetHash", directionsOutput.path("candidateSetHash").asText()));
         mvc.perform(post("/api/agent/tasks/{id}/confirm-direction", taskId)
                         .cookie(viewer).with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"directionId\":\"DIR-02\"}"))
+                        .content(directionPayload))
                 .andExpect(status().isForbidden());
         mvc.perform(post("/api/agent/tasks/{id}/confirm-direction", taskId)
                         .cookie(owner).with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"directionId\":\"DIR-02\"}"))
+                        .content(directionPayload))
                 .andExpect(status().isOk());
         worker.poll();
 
@@ -398,6 +421,7 @@ class AgentWorkflowHttpTest {
         String commentPayload = json.writeValueAsString(Map.of(
                 "strobeItemResultId", strobeItemId,
                 "commentType", "STATISTICAL",
+                "responsibility", "STATISTICAL_REVIEW",
                 "content", "请补充样本量参数来源和统计学确认依据。"));
         mvc.perform(post("/api/agent/tasks/{id}/expert-review/comments", taskId)
                         .cookie(viewer).with(csrf())
@@ -415,6 +439,7 @@ class AgentWorkflowHttpTest {
                         .value("STATISTICAL"));
 
         String decisionPayload = json.writeValueAsString(Map.of(
+                "responsibility", "STATISTICAL_REVIEW",
                 "decision", "APPROVE",
                 "summary", "当前版本可进入课题负责人确认，统计参数仍需在正式研究前落实。",
                 "expectedVersion", 0));
@@ -428,22 +453,35 @@ class AgentWorkflowHttpTest {
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(decisionPayload))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$.data.status").value("EXPERT_APPROVED"))
+                .andExpect(jsonPath("$.data.status").value("WAITING_EXPERT_REVIEW"))
                 .andExpect(jsonPath("$.data.version").value(1));
+
+        String medicalDecisionPayload = json.writeValueAsString(Map.of(
+                "responsibility", "MEDICAL_REVIEW",
+                "decision", "APPROVE",
+                "summary", "医学研究设计和终点定义可接受。",
+                "expectedVersion", 1));
+        mvc.perform(post("/api/agent/tasks/{id}/expert-review/decision", taskId)
+                        .cookie(medicalExpert).with(csrf())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(medicalDecisionPayload))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("EXPERT_APPROVED"))
+                .andExpect(jsonPath("$.data.version").value(2));
 
         mvc.perform(post("/api/agent/tasks/{id}/expert-review/owner-confirmation", taskId)
                         .cookie(viewer).with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"expectedVersion\":1}"))
+                        .content("{\"expectedVersion\":2}"))
                 .andExpect(status().isForbidden());
         mvc.perform(post("/api/agent/tasks/{id}/expert-review/owner-confirmation", taskId)
                         .cookie(owner).with(csrf())
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"expectedVersion\":1}"))
+                        .content("{\"expectedVersion\":2}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.status").value("APPROVED"))
                 .andExpect(jsonPath("$.data.sectionsLocked").value(true))
-                .andExpect(jsonPath("$.data.history[3].actionType")
+                .andExpect(jsonPath("$.data.history[4].actionType")
                         .value("OWNER_CONFIRMED"));
         mvc.perform(get("/api/agent/tasks/{id}", taskId).cookie(viewer))
                 .andExpect(status().isOk())

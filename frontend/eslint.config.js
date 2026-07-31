@@ -14,7 +14,9 @@ export default tseslint.config(
       globals: {
         File: 'readonly',
         Event: 'readonly',
+        BeforeUnloadEvent: 'readonly',
         HTMLInputElement: 'readonly',
+        window: 'readonly',
       },
     },
     rules: {

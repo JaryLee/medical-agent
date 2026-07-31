@@ -2,6 +2,8 @@ package com.jarylee.medicalagent.agent;
 
 import com.jarylee.medicalagent.agent.model.LogicalModelType;
 import com.jarylee.medicalagent.agent.model.ModelRouter;
+import com.jarylee.medicalagent.agent.model.ModelInvocation;
+import com.jarylee.medicalagent.agent.model.ModelRoute;
 import com.jarylee.medicalagent.agent.model.ResearchModels.*;
 import com.jarylee.medicalagent.agent.prompt.PromptTemplateRegistry;
 import com.jarylee.medicalagent.document.ControlledDocxService;
@@ -30,13 +32,56 @@ public class PrototypeService {
     }
 
     public AnalysisResult analyze(String idea) {
+        return analyzeIdea(idea);
+    }
+
+    public AnalysisResult analyzeIdea(String idea) {
         return outputValidator.validate(
                 modelRouter.route(LogicalModelType.RESEARCH_FAST).analyzeIdea(
                         idea, prompts.require("STEP_01_PARSE_IDEA")));
     }
 
+    public AnalysisResult generateDirections(String contextualIdea) {
+        return outputValidator.validate(
+                modelRouter.route(LogicalModelType.RESEARCH_FAST).analyzeIdea(
+                        contextualIdea, prompts.require("STEP_04_GENERATE_RESEARCH_DIRECTIONS")));
+    }
+
+    public ModelRoute resolve(LogicalModelType logicalModelType) {
+        return modelRouter.resolve(logicalModelType);
+    }
+
+    public ModelInvocation<AnalysisResult> invokeAnalysis(
+            LogicalModelType logicalModelType,
+            String input,
+            PromptTemplateRegistry.VersionedPrompt prompt) {
+        var invocation = modelRouter.resolve(logicalModelType)
+                .model().invokeAnalysis(input, prompt);
+        return new ModelInvocation<>(
+                outputValidator.validate(invocation.output()),
+                invocation.providerRequestId(),
+                invocation.finishReason(),
+                invocation.usage());
+    }
+
+    public String modelProvider() {
+        return modelRouter.route(LogicalModelType.RESEARCH_FAST).provider();
+    }
+
+    public String modelName() {
+        return modelRouter.route(LogicalModelType.RESEARCH_FAST).modelName();
+    }
+
     public ResearchQuestionResult buildResearchQuestion(String idea, String directionId) {
-        AnalysisResult analysis = analyze(idea);
+        return buildResearchQuestion(analyzeIdea(idea), directionId);
+    }
+
+    public ResearchQuestionResult buildResearchQuestion(
+            AnalysisResult confirmedAnalysis, String directionId) {
+        if (confirmedAnalysis == null) {
+            throw new IllegalArgumentException("缺少已确认研究方向快照");
+        }
+        AnalysisResult analysis = outputValidator.validate(confirmedAnalysis);
         ResearchDirection selected = analysis.directions().stream()
                 .filter(direction -> direction.id().equals(directionId))
                 .findFirst()

@@ -44,6 +44,7 @@ import java.util.stream.Collectors;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class AgentWorkflowTest {
     private static final String IDEA = "我想研究2型糖尿病患者使用SGLT2抑制剂后肾功能的变化";
@@ -55,9 +56,17 @@ class AgentWorkflowTest {
             new MemoryIdentityRepository(store), currentUser, audit);
     private final MemoryAgentWorkflowRepository repository = new MemoryAgentWorkflowRepository();
     private final ObjectMapper json = new ObjectMapper().findAndRegisterModules();
-    private final SearchStrategyService searchStrategies = new SearchStrategyService();
     private final Clock clock = Clock.fixed(
             Instant.parse("2026-07-27T02:00:00Z"), ZoneOffset.UTC);
+    private final MemoryModelCallAuditRepository modelCallRepository =
+            new MemoryModelCallAuditRepository();
+    private final ModelCallAuditService modelCalls =
+            new ModelCallAuditService(
+                    modelCallRepository, json, clock,
+                    new com.jarylee.medicalagent.safety.ExternalModelInputGuard(
+                            new com.jarylee.medicalagent.safety.SensitiveContentPolicy(),
+                            new com.jarylee.medicalagent.safety.PromptInjectionPolicy()));
+    private final SearchStrategyService searchStrategies = new SearchStrategyService();
     private final LiteratureSearchService literatureSearch = new LiteratureSearchService(
             new MockPubMedSearchGateway(json), new MemoryLiteratureSearchRepository(),
             new MemoryObjectStorage(), json, clock, 20);
@@ -108,8 +117,12 @@ class AgentWorkflowTest {
             new MockModelRouter(new MockResearchModel()), new MockPubMedGateway(),
             new ControlledDocxService(), new ResearchOutputValidator(), new PromptTemplateRegistry());
     private final AgentWorkflowWorker worker = new AgentWorkflowWorker(
-            repository, service, prototype, json, clock, Duration.ofSeconds(30),
-            new PromptTemplateRegistry(), studyRules, searchStrategies,
+            repository, service, prototype, json, clock, Duration.ofSeconds(45),
+            Duration.ofSeconds(10),
+            new PromptTemplateRegistry(), modelCalls,
+            new AgentToolCallService(
+                    new MemoryAgentToolCallRepository(), json, clock),
+            studyRules, searchStrategies,
             literatureSearch, clinicalTrialsSearch, literatureValidation,
             similarResearchAnalysis, observationalDesign, protocolGeneration,
             statisticalAnalysis, claimCitationValidation, strobeCompleteness,
@@ -136,10 +149,33 @@ class AgentWorkflowTest {
         var waiting = service.get(created.id());
         assertThat(waiting.currentStep()).isEqualTo("STEP_05_CONFIRM_DIRECTION");
         assertThat(waiting.output().at("/directions")).hasSize(3);
+        var modelAudit = modelCallRepository.findByTask(hospitalId, created.id());
+        assertThat(modelAudit)
+                .extracting(ModelCallAuditRepository.ModelCallData::stepCode)
+                .containsExactly("STEP_01_PARSE_IDEA", "STEP_04_GENERATE_RESEARCH_DIRECTIONS");
+        assertThat(modelAudit)
+                .allSatisfy(call -> {
+                    assertThat(call.status()).isEqualTo("SUCCEEDED");
+                    assertThat(call.inputSha256()).matches("[0-9a-f]{64}");
+                    assertThat(call.outputSha256()).matches("[0-9a-f]{64}");
+                    assertThat(call.inputSnapshotJson()).doesNotContain(IDEA);
+                    assertThat(call.inputSnapshotJson())
+                            .contains("promptTemplate", "replaySources");
+                    assertThat(call.outputSnapshotJson())
+                            .contains("controlledOutput", "durationMs");
+                });
 
         long lastBeforeConfirmation = repository
                 .findEventsAfter(hospitalId, created.id(), 0).getLast().id();
-        service.confirm(created.id(), "DIR-02");
+        assertThatThrownBy(() -> service.confirm(
+                created.id(), "DIR-02",
+                UUID.fromString(waiting.output().path("candidateSetId").asText()),
+                "0".repeat(64)))
+                .hasMessageContaining("候选集已变化");
+        service.confirm(
+                created.id(), "DIR-02",
+                UUID.fromString(waiting.output().path("candidateSetId").asText()),
+                waiting.output().path("candidateSetHash").asText());
         worker.poll();
 
         var strategyWaiting = service.get(created.id());

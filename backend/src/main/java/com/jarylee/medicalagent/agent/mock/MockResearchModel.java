@@ -2,6 +2,9 @@ package com.jarylee.medicalagent.agent.mock;
 
 import com.jarylee.medicalagent.agent.model.ResearchModel;
 import com.jarylee.medicalagent.agent.model.ResearchModels.*;
+import com.jarylee.medicalagent.agent.model.ModelInvocation;
+import com.jarylee.medicalagent.agent.model.ProtocolSectionModel;
+import com.jarylee.medicalagent.agent.model.ObservationalDesignModel;
 import com.jarylee.medicalagent.agent.prompt.PromptTemplateRegistry.VersionedPrompt;
 import org.springframework.stereotype.Component;
 
@@ -11,7 +14,8 @@ import java.util.Locale;
 @Component
 public class MockResearchModel implements ResearchModel {
     private static final String DISCLAIMER =
-            "系统仅提供科研建议，研究设计、统计方案与医学判断须由相应专家确认。";
+            "仅供科研设计讨论，未经伦理和科研管理审批。"
+                    + "研究设计、统计方案与医学判断须由相应专家确认。";
 
     @Override
     public AnalysisResult analyzeIdea(String idea) {
@@ -48,6 +52,110 @@ public class MockResearchModel implements ResearchModel {
             throw new IllegalArgumentException("缺少版本化 Prompt");
         }
         return analyzeIdea(idea);
+    }
+
+    @Override
+    public ModelInvocation<ProtocolSectionModel.GenerationCandidate>
+    generateProtocolSection(
+            ProtocolSectionModel.GenerationRequest request,
+            VersionedPrompt prompt) {
+        requirePrompt(prompt);
+        if (request == null || request.sectionCode() == null
+                || request.currentContent() == null) {
+            throw new IllegalArgumentException("章节生成输入不完整");
+        }
+        List<String> evidence = request.allowedEvidenceIdentifiers() == null
+                ? List.of()
+                : request.allowedEvidenceIdentifiers().stream().limit(2).toList();
+        String evidenceText = evidence.isEmpty()
+                ? ""
+                : "\n\n依据标识：" + String.join("、", evidence) + "。";
+        String content = request.currentContent().strip()
+                .replaceAll("(?i)STEP[_-]?\\d{1,3}", "后续流程")
+                + "\n\n模型辅助候选补充：本节依据已确认事实整理，"
+                + "所有方法、变量和结论仍需医学与统计专家确认。"
+                + evidenceText;
+        var candidate = new ProtocolSectionModel.GenerationCandidate(
+                ProtocolSectionModel.GENERATION_OUTPUT_SCHEMA,
+                request.sectionCode(),
+                content,
+                evidence,
+                List.of("由医生确认本次模型辅助补充是否准确"),
+                List.of("本候选仅用于科研设计讨论，不替代人工审核"));
+        return new ModelInvocation<>(
+                candidate,
+                null,
+                "SYNTHETIC_TEST",
+                new ModelInvocation.ModelUsage(
+                        "SYNTHETIC_TEST", null, null, null, null));
+    }
+
+    @Override
+    public ModelInvocation<ProtocolSectionModel.ReviewAdvisory>
+    reviewProtocolSection(
+            ProtocolSectionModel.ReviewRequest request,
+            VersionedPrompt prompt) {
+        requirePrompt(prompt);
+        var advisory = new ProtocolSectionModel.ReviewAdvisory(
+                ProtocolSectionModel.REVIEW_OUTPUT_SCHEMA,
+                "LOW",
+                List.of(new ProtocolSectionModel.ReviewIssue(
+                        "HUMAN_CONFIRMATION",
+                        "LOW",
+                        request.sectionCode(),
+                        "模型候选仍需医学和统计专家人工确认。",
+                        "保留待确认项并进入既有三方内部审核流程。")),
+                "未发现结构化硬阻断；该结果仅为模型辅助复核建议。",
+                true);
+        return new ModelInvocation<>(
+                advisory,
+                null,
+                "SYNTHETIC_TEST",
+                new ModelInvocation.ModelUsage(
+                        "SYNTHETIC_TEST", null, null, null, null));
+    }
+
+    @Override
+    public ModelInvocation<ObservationalDesignModel.Advice>
+    adviseObservationalDesign(
+            ObservationalDesignModel.AdviceRequest request,
+            VersionedPrompt prompt) {
+        requirePrompt(prompt);
+        if (request == null || request.recommendedStudyType() == null) {
+            throw new IllegalArgumentException("观察性研究设计建议输入不完整");
+        }
+        var selected = request.alternatives().stream()
+                .filter(value -> request.recommendedStudyType()
+                        .equals(value.studyType()))
+                .findFirst()
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "规则推荐未出现在候选设计中"));
+        var advice = new ObservationalDesignModel.Advice(
+                ObservationalDesignModel.OUTPUT_SCHEMA,
+                request.recommendedStudyType(),
+                "ALIGNED",
+                "模型建议与版本化规则推荐一致，仅补充偏倚和人工确认视角。",
+                selected.biasRisks(),
+                request.unresolvedItems(),
+                request.requiredConfirmations(),
+                List.of(
+                        "仅供科研设计讨论，未经伦理和科研管理审批",
+                        "模型建议不能覆盖规则结果，也不能替代研究者确认"),
+                true);
+        return new ModelInvocation<>(
+                advice,
+                null,
+                "SYNTHETIC_TEST",
+                new ModelInvocation.ModelUsage(
+                        "SYNTHETIC_TEST", null, null, null, null));
+    }
+
+    private void requirePrompt(VersionedPrompt prompt) {
+        if (prompt == null || prompt.version() == null || prompt.version().isBlank()
+                || prompt.template() == null
+                || !prompt.template().contains("${input}")) {
+            throw new IllegalArgumentException("缺少版本化 Prompt");
+        }
     }
 
     private ResearchDirection direction(String id, String title, StudyType type,

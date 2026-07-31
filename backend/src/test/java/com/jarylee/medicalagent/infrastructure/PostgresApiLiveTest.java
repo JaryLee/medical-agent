@@ -50,6 +50,7 @@ class PostgresApiLiveTest {
         UUID ownerId = UUID.randomUUID();
         UUID viewerId = UUID.randomUUID();
         UUID expertId = UUID.randomUUID();
+        UUID medicalExpertId = UUID.randomUUID();
         String code = "LIVE-API-" + hospitalId;
         String password = "InitialPass123";
         identities.insertHospital(new IdentityRepository.HospitalData(
@@ -60,6 +61,9 @@ class PostgresApiLiveTest {
         identities.insertUser(user(
                 expertId, hospitalId, "expert-" + expertId, password,
                 Set.of(Role.EXPERT)));
+        identities.insertUser(user(
+                medicalExpertId, hospitalId, "medical-expert-" + medicalExpertId,
+                password, Set.of(Role.EXPERT)));
 
         UUID projectId = null;
         UUID taskId = null;
@@ -82,6 +86,8 @@ class PostgresApiLiveTest {
 
             Cookie viewerCookie = login(code, "viewer-" + viewerId, password);
             Cookie expertCookie = login(code, "expert-" + expertId, password);
+            Cookie medicalExpertCookie = login(
+                    code, "medical-expert-" + medicalExpertId, password);
             String before = mvc.perform(get("/api/research/projects").cookie(viewerCookie))
                     .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
             assertThat(json.readTree(before).at("/data").size()).isZero();
@@ -90,6 +96,12 @@ class PostgresApiLiveTest {
                             .cookie(ownerCookie).with(csrf()).contentType("application/json")
                             .content(json.writeValueAsString(Map.of(
                                     "userId", viewerId.toString(), "role", "VIEWER"))))
+                    .andExpect(status().isOk());
+            mvc.perform(post("/api/research/projects/{id}/members", projectId)
+                            .cookie(ownerCookie).with(csrf()).contentType("application/json")
+                            .content(json.writeValueAsString(Map.of(
+                                    "userId", medicalExpertId.toString(),
+                                    "role", "VIEWER"))))
                     .andExpect(status().isOk());
             mvc.perform(post("/api/research/projects/{id}/members", projectId)
                             .cookie(ownerCookie).with(csrf()).contentType("application/json")
@@ -129,7 +141,8 @@ class PostgresApiLiveTest {
                             .cookie(ownerCookie).with(csrf()).contentType("application/json")
                             .content(json.writeValueAsString(Map.of("answers", clarificationAnswers))))
                     .andExpect(status().isOk());
-            waitForTaskStep(taskId, ownerCookie, "STEP_05_CONFIRM_DIRECTION");
+            String secondDirections = waitForTaskStep(
+                    taskId, ownerCookie, "STEP_05_CONFIRM_DIRECTION");
             Integer clarificationRounds = jdbc.sql("""
                             select count(*) from ai_agent_clarification_round
                             where hospital_id=:hospitalId and task_id=:taskId
@@ -143,9 +156,15 @@ class PostgresApiLiveTest {
                             """).param("question", revisedQuestion).param("taskId", taskId)
                     .query(String.class).single();
             assertThat(secondRoundAnswer).isEqualTo("第二轮修订后的匿名答案");
+            var secondDirectionsOutput = json.readTree(secondDirections).at("/data/output");
             mvc.perform(post("/api/agent/tasks/{id}/confirm-direction", taskId)
                             .cookie(ownerCookie).with(csrf()).contentType("application/json")
-                            .content(json.writeValueAsString(Map.of("directionId", "DIR-02"))))
+                            .content(json.writeValueAsString(Map.of(
+                                    "directionId", "DIR-02",
+                                    "candidateSetId",
+                                    secondDirectionsOutput.path("candidateSetId").asText(),
+                                    "candidateSetHash",
+                                    secondDirectionsOutput.path("candidateSetHash").asText()))))
                     .andExpect(status().isOk());
             String strategyTask = waitForTaskStep(
                     taskId, ownerCookie, "STEP_07_BUILD_SEARCH_STRATEGY");
@@ -284,21 +303,32 @@ class PostgresApiLiveTest {
                             .content(json.writeValueAsString(Map.of(
                                     "strobeItemResultId", strobeItemId,
                                     "commentType", "STATISTICAL",
+                                    "responsibility", "STATISTICAL_REVIEW",
                                     "content", "请核对样本量参数来源。"))))
                     .andExpect(status().isOk());
             mvc.perform(post("/api/agent/tasks/{id}/expert-review/decision", taskId)
                             .cookie(expertCookie).with(csrf())
                             .contentType("application/json")
                             .content(json.writeValueAsString(Map.of(
+                                    "responsibility", "STATISTICAL_REVIEW",
                                     "decision", "APPROVE",
                                     "summary", "当前方案可进入负责人确认。",
                                     "expectedVersion", 0))))
+                    .andExpect(status().isOk());
+            mvc.perform(post("/api/agent/tasks/{id}/expert-review/decision", taskId)
+                            .cookie(medicalExpertCookie).with(csrf())
+                            .contentType("application/json")
+                            .content(json.writeValueAsString(Map.of(
+                                    "responsibility", "MEDICAL_REVIEW",
+                                    "decision", "APPROVE",
+                                    "summary", "医学研究设计可进入负责人确认。",
+                                    "expectedVersion", 1))))
                     .andExpect(status().isOk());
             mvc.perform(post(
                             "/api/agent/tasks/{id}/expert-review/owner-confirmation", taskId)
                             .cookie(ownerCookie).with(csrf())
                             .contentType("application/json")
-                            .content("{\"expectedVersion\":1}"))
+                            .content("{\"expectedVersion\":2}"))
                     .andExpect(status().isOk());
             String exportWaiting = waitForTaskStep(
                     taskId, ownerCookie, "STEP_18_EXPORT_DOCUMENT");
@@ -834,16 +864,20 @@ class PostgresApiLiveTest {
             if (exportObjectKey != null) objectStorage.delete(exportObjectKey);
             if (templateObjectKey != null) objectStorage.delete(templateObjectKey);
             Map<String, Object> users = Map.of(
-                    "owner", ownerId, "viewer", viewerId, "expert", expertId);
-            jdbc.sql("delete from user_session where user_id in (:owner,:viewer,:expert)")
+                    "owner", ownerId, "viewer", viewerId, "expert", expertId,
+                    "medicalExpert", medicalExpertId);
+            jdbc.sql("""
+                    delete from user_session
+                    where user_id in (:owner,:viewer,:expert,:medicalExpert)
+                    """)
                     .params(users).update();
             jdbc.sql("""
                     delete from operation_audit
-                    where actor_user_id in (:owner,:viewer,:expert)
+                    where actor_user_id in (:owner,:viewer,:expert,:medicalExpert)
                     """).params(users).update();
             jdbc.sql("""
                     delete from idempotency_record
-                    where user_id in (:owner,:viewer,:expert)
+                    where user_id in (:owner,:viewer,:expert,:medicalExpert)
                     """).params(users).update();
             if (projectId != null) {
                 if (uploadedObjectKey != null) objectStorage.delete(uploadedObjectKey);
@@ -896,9 +930,15 @@ class PostgresApiLiveTest {
                     .param("hospitalId", hospitalId).update();
             jdbc.sql("delete from citation_style_version where hospital_id=:hospitalId")
                     .param("hospitalId", hospitalId).update();
-            jdbc.sql("delete from user_role where user_id in (:owner,:viewer,:expert)")
+            jdbc.sql("""
+                    delete from user_role
+                    where user_id in (:owner,:viewer,:expert,:medicalExpert)
+                    """)
                     .params(users).update();
-            jdbc.sql("delete from platform_user where id in (:owner,:viewer,:expert)")
+            jdbc.sql("""
+                    delete from platform_user
+                    where id in (:owner,:viewer,:expert,:medicalExpert)
+                    """)
                     .params(users).update();
             jdbc.sql("delete from hospital where id=:id").param("id", hospitalId).update();
         }

@@ -36,15 +36,34 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
     }
 
     @Override
+    public Optional<ReviewTaskData> findLatestByProject(
+            UUID hospitalId, UUID projectId) {
+        return jdbc.sql("""
+                select *
+                from research_review_task
+                where hospital_id=:hospitalId
+                  and project_id=:projectId
+                order by round_no desc,created_at desc,id desc
+                limit 1
+                """)
+                .param("hospitalId", hospitalId)
+                .param("projectId", projectId)
+                .query(this::mapTask)
+                .optional();
+    }
+
+    @Override
     public ReviewTaskData create(ReviewTaskData task) {
         jdbc.sql("""
                 insert into research_review_task(
                     id,hospital_id,project_id,agent_task_id,protocol_id,
                     strobe_check_task_id,status,submitted_by,submitted_at,
+                    round_no,review_content_sha256,legacy_review,
                     sections_locked,version,created_at,updated_at
                 ) values(
                     :id,:hospitalId,:projectId,:agentTaskId,:protocolId,
                     :strobeCheckTaskId,:status,:submittedBy,:submittedAt,
+                    :roundNo,:contentSha256,false,
                     false,0,:submittedAt,:submittedAt
                 )
                 on conflict (agent_task_id) do nothing
@@ -58,6 +77,8 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                 .param("status", task.status())
                 .param("submittedBy", task.submittedBy())
                 .param("submittedAt", Timestamp.from(task.submittedAt()))
+                .param("roundNo", task.roundNo())
+                .param("contentSha256", task.contentSha256())
                 .update();
         return findByAgentTask(task.hospitalId(), task.agentTaskId()).orElseThrow();
     }
@@ -68,11 +89,13 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                 insert into research_review_comment(
                     id,hospital_id,review_task_id,protocol_section_id,
                     protocol_section_version_no,strobe_item_result_id,
-                    comment_type,content,created_by,created_at
+                    comment_type,responsibility,review_round_no,
+                    content,created_by,created_at
                 ) values(
                     :id,:hospitalId,:reviewTaskId,:protocolSectionId,
                     :protocolSectionVersionNo,:strobeItemResultId,
-                    :commentType,:content,:createdBy,:createdAt
+                    :commentType,:responsibility,:reviewRoundNo,
+                    :content,:createdBy,:createdAt
                 )
                 """)
                 .param("id", comment.id())
@@ -82,6 +105,8 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                 .param("protocolSectionVersionNo", comment.protocolSectionVersionNo())
                 .param("strobeItemResultId", comment.strobeItemResultId())
                 .param("commentType", comment.commentType())
+                .param("responsibility", comment.responsibility())
+                .param("reviewRoundNo", comment.reviewRoundNo())
                 .param("content", comment.content())
                 .param("createdBy", comment.createdBy())
                 .param("createdAt", Timestamp.from(comment.createdAt()))
@@ -95,7 +120,8 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
         return jdbc.sql("""
                 select id,hospital_id,review_task_id,protocol_section_id,
                     protocol_section_version_no,strobe_item_result_id,
-                    comment_type,content,created_by,created_at
+                    comment_type,responsibility,review_round_no,
+                    content,created_by,created_at
                 from research_review_comment
                 where hospital_id=:hospitalId and review_task_id=:reviewTaskId
                 order by created_at,id
@@ -110,6 +136,8 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                         (Integer) result.getObject("protocol_section_version_no"),
                         result.getObject("strobe_item_result_id", UUID.class),
                         result.getString("comment_type"),
+                        result.getString("responsibility"),
+                        result.getInt("review_round_no"),
                         result.getString("content"),
                         result.getObject("created_by", UUID.class),
                         result.getTimestamp("created_at").toInstant()))
@@ -121,7 +149,7 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
             UUID hospitalId, UUID reviewTaskId) {
         return jdbc.sql("""
                 select id,hospital_id,review_task_id,action_type,
-                    actor_user_id,summary,occurred_at
+                    review_round_no,actor_user_id,summary,occurred_at
                 from research_review_action
                 where hospital_id=:hospitalId and review_task_id=:reviewTaskId
                 order by occurred_at,id
@@ -133,6 +161,7 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                         result.getObject("hospital_id", UUID.class),
                         result.getObject("review_task_id", UUID.class),
                         result.getString("action_type"),
+                        result.getInt("review_round_no"),
                         result.getObject("actor_user_id", UUID.class),
                         result.getString("summary"),
                         result.getTimestamp("occurred_at").toInstant()))
@@ -142,24 +171,57 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
     @Override
     @Transactional
     public Optional<ReviewTaskData> decide(
-            UUID hospitalId, UUID reviewTaskId, UUID reviewerId, String decision,
-            String summary, java.time.Instant decidedAt, long expectedVersion) {
-        String status = "APPROVE".equals(decision)
-                ? "EXPERT_APPROVED" : "REVISION_REQUIRED";
-        int updated = jdbc.sql("""
+            UUID hospitalId, UUID reviewTaskId, String responsibility,
+            UUID reviewerId, String decision, String summary,
+            String contentSha256, java.time.Instant decidedAt,
+            long expectedVersion) {
+        boolean medical = "MEDICAL_REVIEW".equals(responsibility);
+        String reviewerColumn = medical
+                ? "expert_reviewer_id" : "statistical_reviewer_id";
+        String decisionColumn = medical
+                ? "expert_decision" : "statistical_decision";
+        String summaryColumn = medical
+                ? "expert_summary" : "statistical_summary";
+        String decidedAtColumn = medical
+                ? "expert_decided_at" : "statistical_decided_at";
+        String otherReviewerColumn = medical
+                ? "statistical_reviewer_id" : "expert_reviewer_id";
+        String otherDecisionColumn = medical
+                ? "statistical_decision" : "expert_decision";
+        String sql = """
                 update research_review_task
-                set status=:status,expert_reviewer_id=:reviewerId,
-                    expert_decision=:decision,expert_summary=:summary,
-                    expert_decided_at=:decidedAt,version=version+1,
+                set status=case
+                        when :decision='RETURN_FOR_REVISION'
+                            then 'REVISION_REQUIRED'
+                        when %s='APPROVE' then 'EXPERT_APPROVED'
+                        else 'WAITING_EXPERT_REVIEW'
+                    end,
+                    %s=:reviewerId,
+                    %s=:decision,
+                    %s=:summary,
+                    %s=:decidedAt,
+                    version=version+1,
                     updated_at=:decidedAt
                 where hospital_id=:hospitalId and id=:reviewTaskId
-                  and status='WAITING_EXPERT_REVIEW' and version=:expectedVersion
-                """)
-                .param("status", status)
+                  and status='WAITING_EXPERT_REVIEW'
+                  and review_content_sha256=:contentSha256
+                  and (%s is null or %s=:reviewerId)
+                  and %s is null
+                  and (%s is null or %s<>:reviewerId)
+                  and submitted_by<>:reviewerId
+                  and version=:expectedVersion
+                """.formatted(
+                otherDecisionColumn, reviewerColumn, decisionColumn,
+                summaryColumn, decidedAtColumn,
+                reviewerColumn, reviewerColumn,
+                decisionColumn,
+                otherReviewerColumn, otherReviewerColumn);
+        int updated = jdbc.sql(sql)
                 .param("reviewerId", reviewerId)
                 .param("decision", decision)
                 .param("summary", summary)
                 .param("decidedAt", Timestamp.from(decidedAt))
+                .param("contentSha256", contentSha256)
                 .param("hospitalId", hospitalId)
                 .param("reviewTaskId", reviewTaskId)
                 .param("expectedVersion", expectedVersion)
@@ -171,7 +233,8 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
     @Transactional
     public Optional<ReviewTaskData> ownerConfirmAndLock(
             UUID hospitalId, UUID reviewTaskId, UUID ownerId,
-            java.time.Instant confirmedAt, long expectedVersion) {
+            String contentSha256, java.time.Instant confirmedAt,
+            long expectedVersion) {
         int updated = jdbc.sql("""
                 update research_review_task
                 set status='APPROVED',owner_confirmed_by=:ownerId,
@@ -180,12 +243,17 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                 where hospital_id=:hospitalId and id=:reviewTaskId
                   and status='EXPERT_APPROVED'
                   and expert_decision='APPROVE' and version=:expectedVersion
+                  and statistical_decision='APPROVE'
+                  and review_content_sha256=:contentSha256
+                  and expert_reviewer_id<>:ownerId
+                  and statistical_reviewer_id<>:ownerId
                 """)
                 .param("ownerId", ownerId)
                 .param("confirmedAt", Timestamp.from(confirmedAt))
                 .param("hospitalId", hospitalId)
                 .param("reviewTaskId", reviewTaskId)
                 .param("expectedVersion", expectedVersion)
+                .param("contentSha256", contentSha256)
                 .update();
         if (updated != 1) return Optional.empty();
         ReviewTaskData task = findById(hospitalId, reviewTaskId).orElseThrow();
@@ -217,19 +285,88 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
         jdbc.sql("""
                 insert into research_review_action(
                     id,hospital_id,review_task_id,action_type,
-                    actor_user_id,summary,occurred_at
+                    review_round_no,actor_user_id,summary,occurred_at
                 ) values(
                     :id,:hospitalId,:reviewTaskId,:actionType,
-                    :actorUserId,:summary,:occurredAt
+                    :reviewRoundNo,:actorUserId,:summary,:occurredAt
                 )
                 """)
                 .param("id", action.id())
                 .param("hospitalId", action.hospitalId())
                 .param("reviewTaskId", action.reviewTaskId())
                 .param("actionType", action.actionType())
+                .param("reviewRoundNo", action.reviewRoundNo())
                 .param("actorUserId", action.actorUserId())
                 .param("summary", action.summary())
                 .param("occurredAt", Timestamp.from(action.occurredAt()))
+                .update();
+    }
+
+    @Override
+    public Optional<ReviewTaskData> resetForNewRound(
+            UUID hospitalId, UUID reviewTaskId, String contentSha256,
+            java.time.Instant submittedAt, long expectedVersion) {
+        int updated = jdbc.sql("""
+                update research_review_task
+                set status='WAITING_EXPERT_REVIEW',
+                    round_no=round_no+1,
+                    review_content_sha256=:contentSha256,
+                    legacy_review=false,
+                    submitted_at=:submittedAt,
+                    expert_reviewer_id=null,
+                    expert_decision=null,
+                    expert_summary=null,
+                    expert_decided_at=null,
+                    statistical_reviewer_id=null,
+                    statistical_decision=null,
+                    statistical_summary=null,
+                    statistical_decided_at=null,
+                    owner_confirmed_by=null,
+                    owner_confirmed_at=null,
+                    sections_locked=false,
+                    version=version+1,
+                    updated_at=:submittedAt
+                where hospital_id=:hospitalId and id=:reviewTaskId
+                  and version=:expectedVersion
+                  and (
+                    status='SUPERSEDED'
+                    or review_content_sha256<>:contentSha256
+                  )
+                """)
+                .param("contentSha256", contentSha256)
+                .param("submittedAt", Timestamp.from(submittedAt))
+                .param("hospitalId", hospitalId)
+                .param("reviewTaskId", reviewTaskId)
+                .param("expectedVersion", expectedVersion)
+                .update();
+        return updated == 1
+                ? findById(hospitalId, reviewTaskId)
+                : Optional.empty();
+    }
+
+    @Override
+    public void addDecision(ReviewDecisionData decision) {
+        jdbc.sql("""
+                insert into research_review_decision(
+                    id,hospital_id,review_task_id,review_round_no,
+                    responsibility,reviewer_id,decision,summary,
+                    content_sha256,decided_at
+                ) values(
+                    :id,:hospitalId,:reviewTaskId,:reviewRoundNo,
+                    :responsibility,:reviewerId,:decision,:summary,
+                    :contentSha256,:decidedAt
+                )
+                """)
+                .param("id", decision.id())
+                .param("hospitalId", decision.hospitalId())
+                .param("reviewTaskId", decision.reviewTaskId())
+                .param("reviewRoundNo", decision.reviewRoundNo())
+                .param("responsibility", decision.responsibility())
+                .param("reviewerId", decision.reviewerId())
+                .param("decision", decision.decision())
+                .param("summary", decision.summary())
+                .param("contentSha256", decision.contentSha256())
+                .param("decidedAt", Timestamp.from(decision.decidedAt()))
                 .update();
     }
 
@@ -254,6 +391,9 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                 result.getObject("protocol_id", UUID.class),
                 result.getObject("strobe_check_task_id", UUID.class),
                 result.getString("status"),
+                result.getInt("round_no"),
+                result.getString("review_content_sha256"),
+                result.getBoolean("legacy_review"),
                 result.getObject("submitted_by", UUID.class),
                 result.getTimestamp("submitted_at").toInstant(),
                 result.getObject("expert_reviewer_id", UUID.class),
@@ -261,6 +401,11 @@ public class JdbcExpertReviewRepository implements ExpertReviewRepository {
                 result.getString("expert_summary"),
                 result.getTimestamp("expert_decided_at") == null ? null
                         : result.getTimestamp("expert_decided_at").toInstant(),
+                result.getObject("statistical_reviewer_id", UUID.class),
+                result.getString("statistical_decision"),
+                result.getString("statistical_summary"),
+                result.getTimestamp("statistical_decided_at") == null ? null
+                        : result.getTimestamp("statistical_decided_at").toInstant(),
                 result.getObject("owner_confirmed_by", UUID.class),
                 result.getTimestamp("owner_confirmed_at") == null ? null
                         : result.getTimestamp("owner_confirmed_at").toInstant(),

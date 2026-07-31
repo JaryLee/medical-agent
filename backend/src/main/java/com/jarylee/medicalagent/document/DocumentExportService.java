@@ -11,10 +11,13 @@ import com.jarylee.medicalagent.document.DocumentExportModels.ExportView;
 import com.jarylee.medicalagent.file.ObjectStorage;
 import com.jarylee.medicalagent.research.ResearchProjectService;
 import com.jarylee.medicalagent.review.ExpertReviewRepository;
+import com.jarylee.medicalagent.review.ReviewContentHash;
 import com.jarylee.medicalagent.workflow.AgentEventStream;
 import com.jarylee.medicalagent.workflow.AgentWorkflowRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.security.MessageDigest;
 import java.time.Clock;
@@ -112,6 +115,10 @@ public class DocumentExportService {
         if (!"APPROVED".equals(review.status()) || !review.sectionsLocked()) {
             throw BusinessException.conflict("只有专家和课题负责人已确认的锁定方案可以导出");
         }
+        if (!review.contentSha256().equals(
+                ReviewContentHash.sha256(json, task.outputJson()))) {
+            throw BusinessException.conflict("审核通过后的内容已变化，必须重新完成三方审核");
+        }
         var template = templates.requirePublished(
                 actor.hospitalId(), templateVersionId);
         var citationStyle = citationStyles.requirePublished(
@@ -127,16 +134,18 @@ public class DocumentExportService {
         Map<String, String> values = values(
                 task, project.name(), protocol, citations.references());
         byte[] templateContent = templates.content(actor.hospitalId(), template);
-        byte[] document = engine.render(templateContent, values);
+        byte[] document = ResearchDraftDocxMarker.mark(
+                engine.render(templateContent, values));
         String contentSha256 = sha256(document);
         Instant now = clock.instant();
         UUID exportId = UUID.randomUUID();
         String fileName = safeFileName(project.code() + "-" + project.name())
-                + "-研究方案.docx";
+                + "-科研草案.docx";
         String objectKey = "hospital/" + actor.hospitalId()
                 + "/projects/" + task.projectId() + "/exports/"
                 + exportId + "/" + fileName;
         storage.put(objectKey, document, DOCX_CONTENT_TYPE);
+        deleteObjectOnRollback(objectKey);
         try {
             ObjectNode exportNode = json.createObjectNode();
             exportNode.put("schemaVersion", EXPORT_SCHEMA_VERSION);
@@ -182,11 +191,11 @@ public class DocumentExportService {
             var event = workflows.appendEvent(
                     actor.hospitalId(), agentTaskId, "DOCUMENT_EXPORT_COMPLETED",
                     "STEP_18_EXPORT_DOCUMENT", write(exportNode), now);
-            events.publish(event);
+            publishAfterCommit(event);
             var taskEvent = workflows.appendEvent(
                     actor.hospitalId(), completedTask.id(), "TASK_COMPLETED",
                     "STEP_18_EXPORT_DOCUMENT", write(exportNode), now);
-            events.publish(taskEvent);
+            publishAfterCommit(taskEvent);
             return view(created);
         } catch (RuntimeException exception) {
             storage.delete(objectKey);
@@ -304,7 +313,7 @@ public class DocumentExportService {
                     section.path("content").asText());
         }
         JsonNode peco = readTree(task.outputJson()).path("peco");
-        String owner = identities.findUserById(task.createdBy())
+        String owner = identities.findUserById(task.hospitalId(), task.createdBy())
                 .map(IdentityRepository.UserData::username)
                 .orElse(task.createdBy().toString());
         Map<String, String> values = new LinkedHashMap<>();
@@ -408,6 +417,38 @@ public class DocumentExportService {
                 .strip();
         if (safe.length() > 120) safe = safe.substring(0, 120);
         return safe.isBlank() ? "research-protocol" : safe;
+    }
+
+    private void publishAfterCommit(
+            AgentWorkflowRepository.EventData event) {
+        if (TransactionSynchronizationManager
+                .isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            events.publish(event);
+                        }
+                    });
+        } else {
+            events.publish(event);
+        }
+    }
+
+    private void deleteObjectOnRollback(String objectKey) {
+        if (!TransactionSynchronizationManager
+                .isActualTransactionActive()) {
+            return;
+        }
+        TransactionSynchronizationManager.registerSynchronization(
+                new TransactionSynchronization() {
+                    @Override
+                    public void afterCompletion(int status) {
+                        if (status != STATUS_COMMITTED) {
+                            storage.delete(objectKey);
+                        }
+                    }
+                });
     }
 
     private record CitationSnapshot(

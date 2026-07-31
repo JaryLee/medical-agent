@@ -3,6 +3,7 @@ package com.jarylee.medicalagent.review;
 import com.jarylee.medicalagent.common.ApiResponse;
 import com.jarylee.medicalagent.review.ExpertReviewModels.CommentType;
 import com.jarylee.medicalagent.review.ExpertReviewModels.Decision;
+import com.jarylee.medicalagent.review.ExpertReviewModels.Responsibility;
 import com.jarylee.medicalagent.review.ExpertReviewModels.ReviewView;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.NotBlank;
@@ -40,7 +41,7 @@ public class ExpertReviewController {
         return ApiResponse.ok(service.addComment(
                 agentTaskId, request.protocolSectionId(),
                 request.protocolSectionVersionNo(), request.strobeItemResultId(),
-                request.commentType(), request.content()));
+                request.commentType(), request.responsibility(), request.content()));
     }
 
     @PostMapping("/decision")
@@ -48,7 +49,7 @@ public class ExpertReviewController {
             @PathVariable UUID agentTaskId,
             @Valid @RequestBody DecisionRequest request) {
         return ApiResponse.ok(service.decide(
-                agentTaskId, request.decision(), request.summary(),
+                agentTaskId, request.responsibility(), request.decision(), request.summary(),
                 request.expectedVersion()));
     }
 
@@ -65,10 +66,12 @@ public class ExpertReviewController {
             @Positive Integer protocolSectionVersionNo,
             UUID strobeItemResultId,
             @NotNull CommentType commentType,
+            @NotNull Responsibility responsibility,
             @NotBlank @Size(max = 2000) String content
     ) {}
 
     public record DecisionRequest(
+            @NotNull Responsibility responsibility,
             @NotNull Decision decision,
             @NotBlank @Size(max = 2000) String summary,
             @PositiveOrZero long expectedVersion

@@ -10,6 +10,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "test:e2e:v2": "playwright test --config=playwright.v2.config.ts",
     "test:e2e:deepseek": "playwright test --config=playwright.deepseek.config.ts"
   },
   "overrides": {

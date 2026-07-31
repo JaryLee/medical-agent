@@ -10,6 +10,18 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18-trixie
+        env:
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-java@v5
@@ -17,9 +29,14 @@ jobs:
           distribution: temurin
           java-version: "21"
           cache: maven
-      - name: Backend tests
+      - name: Prepare PostgreSQL roles
+        env:
+          PGHOST: 127.0.0.1
+          PGUSER: postgres
+        run: psql -d postgres -c "create role medical_agent login"
+      - name: Backend tests and required live PostgreSQL gates
         working-directory: backend
-        run: mvn --batch-mode verify
+        run: mvn --batch-mode -DlivePostgresFlyway=true verify
 
   frontend:
     runs-on: ubuntu-latest

@@ -36,6 +36,8 @@ class ResearchProjectIsolationTest {
         currentUser.user = userB;
 
         assertThat(service.list()).isEmpty();
+        assertThatThrownBy(() -> service.getByKey(project.projectKey()))
+                .isInstanceOf(BusinessException.class).hasMessage("课题不存在");
         assertThatThrownBy(() -> service.get(project.id()))
                 .isInstanceOf(BusinessException.class).hasMessage("课题不存在");
         assertThatThrownBy(() -> service.update(project.id(), "越权修改", 0))
@@ -47,12 +49,26 @@ class ResearchProjectIsolationTest {
         var first = service.create("P-001", "初始课题", "same-key");
         var replay = service.create("DIFFERENT", "不会创建", "same-key");
         assertThat(replay.id()).isEqualTo(first.id());
+        assertThat(replay.projectKey()).isEqualTo(first.projectKey());
+        assertThat(service.getByKey(first.projectKey()).projectKey())
+                .isEqualTo(first.projectKey());
         assertThat(store.projects).hasSize(1);
 
         var updated = service.update(first.id(), "新名称", 0);
         assertThat(updated.version()).isEqualTo(1);
         assertThatThrownBy(() -> service.update(first.id(), "过期修改", 0))
                 .isInstanceOf(BusinessException.class).hasMessageContaining("其他用户修改");
+    }
+
+    @Test
+    void invalidAndUnknownPublicKeysUseTheSameNotFoundBoundary() {
+        assertThatThrownBy(() -> service.getByKey("bad-key"))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("课题不存在");
+        assertThatThrownBy(() -> service.getByKey(
+                "prj_0123456789ABCDEFGHJKMNPQRS"))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("课题不存在");
     }
 
     @Test

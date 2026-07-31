@@ -36,7 +36,7 @@ class AuthenticationServiceTest {
 
     @Test
     void loginUsesHospitalCodeAndOpaqueSession() {
-        var login = service.login("HOSP-A", "doctor", "InitialPass123");
+        var login = service.login(" hosp-a ", " ｄｏｃｔｏｒ ", "InitialPass123");
         assertThat(login.token()).doesNotContain("doctor");
         assertThat(service.authenticateToken(login.token()).hospitalId()).isEqualTo(hospitalId);
         assertThat(store.sessions.keySet()).noneMatch(key -> key.equals(login.token()));

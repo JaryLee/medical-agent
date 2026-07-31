@@ -89,6 +89,12 @@ class DeepSeekResearchModelTest {
                 }
                 """;
         String response = json.writeValueAsString(Map.of(
+                "id", "request-safe-001",
+                "usage", Map.of(
+                        "prompt_tokens", 120,
+                        "prompt_cache_hit_tokens", 20,
+                        "completion_tokens", 80,
+                        "total_tokens", 200),
                 "choices", List.of(Map.of(
                         "finish_reason", "stop",
                         "message", Map.of("content", analysisJson)))));
@@ -99,11 +105,20 @@ class DeepSeekResearchModelTest {
                 .willReturn(okJson(response)));
 
         DeepSeekResearchModel model = model(true);
-        var result = model.analyzeIdea("研究SGLT2抑制剂与eGFR变化", new VersionedPrompt(
+        var invocation = model.invokeAnalysis(
+                "研究SGLT2抑制剂与eGFR变化", new VersionedPrompt(
                 "STEP_01_PARSE_IDEA", "research-idea-analysis/v1", "输入：${input}"));
+        var result = invocation.output();
 
         assertThat(result.schemaVersion()).isEqualTo("research-analysis/v1");
         assertThat(result.directions()).hasSize(3);
+        assertThat(invocation.providerRequestId()).isEqualTo("request-safe-001");
+        assertThat(invocation.finishReason()).isEqualTo("stop");
+        assertThat(invocation.usage().source()).isEqualTo("PROVIDER_REPORTED");
+        assertThat(invocation.usage().inputTokens()).isEqualTo(120);
+        assertThat(invocation.usage().cachedInputTokens()).isEqualTo(20);
+        assertThat(invocation.usage().outputTokens()).isEqualTo(80);
+        assertThat(invocation.usage().totalTokens()).isEqualTo(200);
         assertThat(model.provider()).isEqualTo("deepseek");
         server.verify(1, postRequestedFor(urlEqualTo("/chat/completions")));
     }

@@ -2,6 +2,7 @@ package com.jarylee.medicalagent.infrastructure;
 
 import com.jarylee.medicalagent.auth.Role;
 import com.jarylee.medicalagent.auth.IdentityRepository;
+import com.jarylee.medicalagent.auth.IdentityNormalizer;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.ApplicationArguments;
 import org.springframework.boot.ApplicationRunner;
@@ -30,8 +31,9 @@ public class BootstrapConfiguration implements ApplicationRunner {
     @Override
     public void run(ApplicationArguments args) {
         if (!username.isBlank() && !password.isBlank()
-                && repository.findUser(null, username).isEmpty()) {
-            var admin = new IdentityRepository.UserData(UUID.randomUUID(), null, username,
+                && repository.findUser(null, IdentityNormalizer.username(username)).isEmpty()) {
+            var admin = new IdentityRepository.UserData(
+                    UUID.randomUUID(), null, IdentityNormalizer.username(username),
                     encoder.encode(password), Set.of(Role.PLATFORM_ADMIN),
                     true, true, 0, null);
             repository.insertUser(admin);

@@ -39,7 +39,8 @@ public class ResearchProjectService {
         var existing = repository.findIdempotentResource(actor.hospitalId(), actor.userId(),
                 "PROJECT_CREATE", idempotencyKey);
         if (existing.isPresent()) return get(existing.get());
-        var row = repository.insert(actor.hospitalId(), code.trim(), name.trim());
+        var row = repository.insert(
+                actor.hospitalId(), ProjectKey.generate(), code.trim(), name.trim());
         members.add(actor.hospitalId(), row.id(), actor.userId(), ProjectMemberRole.OWNER);
         repository.saveIdempotency(actor.hospitalId(), actor.userId(), "PROJECT_CREATE",
                 idempotencyKey, row.id());
@@ -50,24 +51,41 @@ public class ResearchProjectService {
     public List<ProjectView> list() {
         AuthenticatedUser actor = requireReadyUser();
         boolean allAccess = actor.hasRole(Role.HOSPITAL_ADMIN);
-        return repository.findAll(actor.hospitalId()).stream()
-                .filter(row -> allAccess || members.findRole(
-                        actor.hospitalId(), row.id(), actor.userId()).isPresent())
+        return repository.findVisible(
+                        actor.hospitalId(), actor.userId(), allAccess).stream()
                 .map(this::view).toList();
     }
 
     public ProjectView get(UUID id) {
         AuthenticatedUser actor = requireReadyUser();
         var row = repository.findById(actor.hospitalId(), id)
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         requireAccess(actor, id);
         return view(row);
+    }
+
+    public PublicProjectView getByKey(String projectKey) {
+        AuthenticatedUser actor = requireReadyUser();
+        if (!ProjectKey.isValid(projectKey)) {
+            audit.record(actor, "PROJECT_KEY_LOOKUP_NOT_FOUND",
+                    "RESEARCH_PROJECT", "invalid");
+            throw BusinessException.projectNotFound();
+        }
+        var row = repository.findVisibleByKey(
+                        actor.hospitalId(), projectKey, actor.userId(),
+                        actor.hasRole(Role.HOSPITAL_ADMIN))
+                .orElseThrow(() -> {
+                    audit.record(actor, "PROJECT_KEY_LOOKUP_NOT_FOUND",
+                            "RESEARCH_PROJECT", projectKey);
+                    return BusinessException.projectNotFound();
+                });
+        return publicView(row);
     }
 
     public ProjectView requireEditable(UUID id) {
         AuthenticatedUser actor = requireReadyUser();
         var row = repository.findById(actor.hospitalId(), id)
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         requireEditAccess(actor, id);
         return view(row);
     }
@@ -75,9 +93,9 @@ public class ResearchProjectService {
     public ProjectView requireOwner(UUID id) {
         AuthenticatedUser actor = requireReadyUser();
         var row = repository.findById(actor.hospitalId(), id)
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         var role = members.findRole(actor.hospitalId(), id, actor.userId())
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         if (role != ProjectMemberRole.OWNER) {
             throw BusinessException.forbidden("只有课题负责人可以完成最终确认");
         }
@@ -97,10 +115,10 @@ public class ResearchProjectService {
     public MemberView addMember(UUID projectId, UUID userId, ProjectMemberRole role) {
         AuthenticatedUser actor = requireReadyUser();
         repository.findById(actor.hospitalId(), projectId)
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         requireManageAccess(actor, projectId);
-        var target = identities.findUserById(userId)
-                .filter(user -> user.enabled() && Objects.equals(user.hospitalId(), actor.hospitalId()))
+        var target = identities.findUserById(actor.hospitalId(), userId)
+                .filter(IdentityRepository.UserData::enabled)
                 .orElseThrow(() -> BusinessException.notFound("用户不存在"));
         members.add(actor.hospitalId(), projectId, userId, role);
         audit.record(actor, "PROJECT_MEMBER_ADDED", "RESEARCH_PROJECT", projectId.toString());
@@ -110,11 +128,12 @@ public class ResearchProjectService {
     public List<MemberView> listMembers(UUID projectId) {
         AuthenticatedUser actor = requireReadyUser();
         repository.findById(actor.hospitalId(), projectId)
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         requireAccess(actor, projectId);
         return members.findAll(actor.hospitalId(), projectId).stream()
                 .map(member -> {
-                    String username = identities.findUserById(member.userId())
+                    String username = identities.findUserById(
+                                    actor.hospitalId(), member.userId())
                             .map(IdentityRepository.UserData::username).orElse("unknown");
                     return new MemberView(member.userId(), username, member.role());
                 }).toList();
@@ -123,21 +142,21 @@ public class ResearchProjectService {
     private void requireAccess(AuthenticatedUser actor, UUID projectId) {
         if (actor.hasRole(Role.HOSPITAL_ADMIN)) return;
         if (members.findRole(actor.hospitalId(), projectId, actor.userId()).isEmpty()) {
-            throw BusinessException.notFound("课题不存在");
+            throw BusinessException.projectNotFound();
         }
     }
 
     private void requireEditAccess(AuthenticatedUser actor, UUID projectId) {
         if (actor.hasRole(Role.HOSPITAL_ADMIN)) return;
         var role = members.findRole(actor.hospitalId(), projectId, actor.userId())
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         if (role == ProjectMemberRole.VIEWER) throw BusinessException.forbidden("课题仅可查看");
     }
 
     private void requireManageAccess(AuthenticatedUser actor, UUID projectId) {
         if (actor.hasRole(Role.HOSPITAL_ADMIN)) return;
         var role = members.findRole(actor.hospitalId(), projectId, actor.userId())
-                .orElseThrow(() -> BusinessException.notFound("课题不存在"));
+                .orElseThrow(BusinessException::projectNotFound);
         if (role != ProjectMemberRole.OWNER) throw BusinessException.forbidden("无权管理课题成员");
     }
 
@@ -148,9 +167,18 @@ public class ResearchProjectService {
     }
 
     private ProjectView view(ProjectRepository.ProjectData row) {
-        return new ProjectView(row.id(), row.code(), row.name(), row.version());
+        return new ProjectView(
+                row.id(), row.projectKey(), row.code(), row.name(), row.version());
     }
 
-    public record ProjectView(UUID id, String code, String name, long version) {}
+    private PublicProjectView publicView(ProjectRepository.ProjectData row) {
+        return new PublicProjectView(
+                row.projectKey(), row.code(), row.name(), row.version());
+    }
+
+    public record ProjectView(
+            UUID id, String projectKey, String code, String name, long version) {}
+    public record PublicProjectView(
+            String projectKey, String code, String name, long version) {}
     public record MemberView(UUID userId, String username, ProjectMemberRole role) {}
 }

@@ -9,7 +9,7 @@
     "resolveJsonModule": true,
     "esModuleInterop": true,
     "lib": ["ESNext", "DOM", "DOM.Iterable"],
-    "types": ["node", "vitest/globals", "web-bluetooth"],
+    "types": ["node", "vite/client", "vitest/globals", "web-bluetooth"],
     "skipLibCheck": true,
     "noEmit": true
   },

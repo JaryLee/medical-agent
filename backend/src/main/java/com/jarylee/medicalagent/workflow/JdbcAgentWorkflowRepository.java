@@ -10,6 +10,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -42,10 +44,56 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
         return jdbc.sql("select " + TASK_COLUMNS + """
                         from ai_agent_task
                         where hospital_id=:hospitalId and project_id=:projectId
-                        order by created_at desc
+                        order by created_at desc, id desc
                         """)
                 .param("hospitalId", hospitalId).param("projectId", projectId)
                 .query(this::mapTask).list();
+    }
+
+    @Override
+    public Optional<StepData> findLatestStep(
+            UUID hospitalId, UUID taskId, String stepCode) {
+        return jdbc.sql("""
+                select id,hospital_id,task_id,step_code,attempt_no,status,
+                       input_schema_version,output_schema_version,
+                       input_json::text,output_json::text,model_call_id,
+                       prompt_version,tool_calls_json::text,error_code,error_message,
+                       started_at,completed_at,requires_confirmation,
+                       confirmed_by,confirmed_at
+                from ai_agent_step_run
+                where hospital_id=:hospitalId
+                  and task_id=:taskId
+                  and step_code=:stepCode
+                order by attempt_no desc,started_at desc,id desc
+                limit 1
+                """)
+                .param("hospitalId", hospitalId)
+                .param("taskId", taskId)
+                .param("stepCode", stepCode)
+                .query((result, row) -> new StepData(
+                        result.getObject("id", UUID.class),
+                        result.getObject("hospital_id", UUID.class),
+                        result.getObject("task_id", UUID.class),
+                        result.getString("step_code"),
+                        result.getInt("attempt_no"),
+                        result.getString("status"),
+                        result.getString("input_schema_version"),
+                        result.getString("output_schema_version"),
+                        result.getString("input_json"),
+                        result.getString("output_json"),
+                        result.getObject("model_call_id", UUID.class),
+                        result.getString("prompt_version"),
+                        result.getString("tool_calls_json"),
+                        result.getString("error_code"),
+                        result.getString("error_message"),
+                        result.getTimestamp("started_at").toInstant(),
+                        result.getTimestamp("completed_at") == null
+                                ? null : result.getTimestamp("completed_at").toInstant(),
+                        result.getBoolean("requires_confirmation"),
+                        result.getObject("confirmed_by", UUID.class),
+                        result.getTimestamp("confirmed_at") == null
+                                ? null : result.getTimestamp("confirmed_at").toInstant()))
+                .optional();
     }
 
     @Override
@@ -109,6 +157,341 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
                         """)
                 .param("now", Timestamp.from(now)).param("limit", limit)
                 .query(this::mapTask).list();
+    }
+
+    @Override
+    @Transactional
+    public Optional<ClaimedTask> claimNext(
+            Instant now, String leaseOwner, Duration leaseDuration) {
+        UUID executionToken = UUID.randomUUID();
+        UUID attemptId = UUID.randomUUID();
+        Instant leaseUntil = now.plus(leaseDuration);
+        return jdbc.sql("""
+                with candidate as (
+                    select id,hospital_id,current_step,current_step_attempt_id
+                    from ai_agent_task
+                    where cancel_requested=false and timeout_at>:now
+                      and (
+                        status='QUEUED'
+                        or (status='RUNNING' and lease_until<:now)
+                      )
+                    order by created_at,id
+                    for update skip locked
+                    limit 1
+                ),
+                attempt_number as (
+                    select candidate.*,
+                           coalesce(max(existing.attempt_no),0)+1 as attempt_no
+                    from candidate
+                    left join ai_agent_step_attempt existing
+                      on existing.hospital_id=candidate.hospital_id
+                     and existing.task_id=candidate.id
+                     and existing.step_code=candidate.current_step
+                    group by candidate.id,candidate.hospital_id,candidate.current_step,
+                             candidate.current_step_attempt_id
+                ),
+                previous_attempt as (
+                    update ai_agent_step_attempt previous
+                    set status='LEASE_LOST',completed_at=:now,
+                        error_code='LEASE_EXPIRED',
+                        error_message='执行租约已过期，由新 Worker 接管'
+                    from attempt_number
+                    where previous.id=attempt_number.current_step_attempt_id
+                      and previous.status='RUNNING'
+                    returning previous.id
+                ),
+                inserted_attempt as (
+                    insert into ai_agent_step_attempt(
+                        id,hospital_id,task_id,step_code,attempt_no,execution_token,
+                        lease_owner,status,started_at,heartbeat_at
+                    )
+                    select :attemptId,hospital_id,id,current_step,attempt_no,
+                           :executionToken,:leaseOwner,'RUNNING',:now,:now
+                    from attempt_number
+                    cross join (select count(*) from previous_attempt) fenced
+                    returning id,task_id,step_code,attempt_no
+                ),
+                claimed as (
+                    update ai_agent_task task
+                    set status='RUNNING',lease_until=:leaseUntil,
+                        execution_token=:executionToken,lease_owner=:leaseOwner,
+                        lease_acquired_at=:now,heartbeat_at=:now,
+                        current_step_attempt_id=:attemptId,
+                        version=task.version+1,updated_at=:now
+                    from inserted_attempt
+                    where task.id=inserted_attempt.task_id
+                    returning task.*
+                ),
+                started_event as (
+                    insert into ai_agent_event(
+                        hospital_id,task_id,event_key,event_type,step_code,
+                        payload_json,occurred_at
+                    )
+                    select claimed.hospital_id,claimed.id,:startedEventKey,
+                           'TASK_STARTED',claimed.current_step,
+                           '{"status":"RUNNING"}'::jsonb,:now
+                    from claimed
+                    returning id,hospital_id,task_id,event_type,step_code,
+                              payload_json::text,occurred_at
+                )
+                select
+                       claimed.id,claimed.hospital_id,claimed.project_id,
+                       claimed.created_by,claimed.current_step,claimed.status,
+                       claimed.input_json::text,claimed.output_json::text,
+                       claimed.lease_until,claimed.timeout_at,
+                       claimed.cancel_requested,claimed.version,
+                       claimed.last_error_code,claimed.last_error_message,
+                       claimed.created_at,claimed.updated_at,claimed.completed_at,
+                       inserted_attempt.id as claimed_attempt_id,
+                       inserted_attempt.attempt_no as claimed_attempt_no,
+                       started_event.id as started_event_id,
+                       started_event.hospital_id as started_event_hospital_id,
+                       started_event.task_id as started_event_task_id,
+                       started_event.event_type as started_event_type,
+                       started_event.step_code as started_event_step_code,
+                       started_event.payload_json as started_event_payload_json,
+                       started_event.occurred_at as started_event_occurred_at
+                from claimed
+                join inserted_attempt on inserted_attempt.task_id=claimed.id
+                join started_event on started_event.task_id=claimed.id
+                """)
+                .param("now", Timestamp.from(now))
+                .param("leaseUntil", Timestamp.from(leaseUntil))
+                .param("leaseOwner", leaseOwner)
+                .param("executionToken", executionToken)
+                .param("attemptId", attemptId)
+                .param("startedEventKey", attemptId + ":started")
+                .query((result, row) -> {
+                    TaskData task = mapTask(result, row);
+                    ClaimHandle handle = new ClaimHandle(
+                            task.hospitalId(), task.id(), task.currentStep(),
+                            executionToken,
+                            result.getObject("claimed_attempt_id", UUID.class),
+                            result.getInt("claimed_attempt_no"),
+                            leaseOwner);
+                    EventData startedEvent = new EventData(
+                            result.getLong("started_event_id"),
+                            result.getObject("started_event_hospital_id", UUID.class),
+                            result.getObject("started_event_task_id", UUID.class),
+                            result.getString("started_event_type"),
+                            result.getString("started_event_step_code"),
+                            result.getString("started_event_payload_json"),
+                            result.getTimestamp("started_event_occurred_at").toInstant());
+                    return new ClaimedTask(task, handle, List.of(startedEvent));
+                })
+                .optional();
+    }
+
+    @Override
+    @Transactional
+    public boolean heartbeat(
+            ClaimHandle claim, Instant leaseUntil, Instant heartbeatAt) {
+        int taskUpdated = jdbc.sql("""
+                update ai_agent_task
+                set lease_until=:leaseUntil,heartbeat_at=:heartbeatAt,
+                    updated_at=:heartbeatAt
+                where hospital_id=:hospitalId and id=:taskId
+                  and status='RUNNING' and execution_token=:executionToken
+                  and current_step_attempt_id=:attemptId
+                """)
+                .param("leaseUntil", Timestamp.from(leaseUntil))
+                .param("heartbeatAt", Timestamp.from(heartbeatAt))
+                .param("hospitalId", claim.hospitalId())
+                .param("taskId", claim.taskId())
+                .param("executionToken", claim.executionToken())
+                .param("attemptId", claim.stepAttemptId())
+                .update();
+        if (taskUpdated != 1) return false;
+        int attemptUpdated = jdbc.sql("""
+                update ai_agent_step_attempt
+                set heartbeat_at=:heartbeatAt
+                where id=:attemptId and execution_token=:executionToken
+                  and status='RUNNING'
+                """)
+                .param("heartbeatAt", Timestamp.from(heartbeatAt))
+                .param("attemptId", claim.stepAttemptId())
+                .param("executionToken", claim.executionToken())
+                .update();
+        if (attemptUpdated != 1) {
+            throw new IllegalStateException(
+                    "Agent任务与步骤尝试心跳不一致");
+        }
+        return true;
+    }
+
+    @Override
+    @Transactional
+    public CommitOutcome commitClaim(
+            ClaimHandle claim, List<StepData> steps, TaskTransition transition,
+            List<PendingEvent> events, Instant committedAt) {
+        Optional<TaskData> locked = lockActiveClaim(claim);
+        if (locked.isEmpty()) {
+            return completedOrStale(claim, "COMPLETED", events);
+        }
+        for (StepData step : steps) {
+            insertStep(step, claim.stepAttemptId());
+        }
+        int attemptUpdated = jdbc.sql("""
+                update ai_agent_step_attempt
+                set status='COMPLETED',completed_at=:committedAt,
+                    heartbeat_at=:committedAt,error_code=null,error_message=null
+                where id=:attemptId and execution_token=:executionToken
+                  and status='RUNNING'
+                """)
+                .param("committedAt", Timestamp.from(committedAt))
+                .param("attemptId", claim.stepAttemptId())
+                .param("executionToken", claim.executionToken())
+                .update();
+        if (attemptUpdated != 1) {
+            throw new IllegalStateException("Agent步骤尝试当前不可完成");
+        }
+        int taskUpdated = jdbc.sql("""
+                update ai_agent_task
+                set current_step=:nextStep,status=:nextStatus,
+                    output_json=cast(:outputJson as jsonb),
+                    lease_until=null,execution_token=null,lease_owner=null,
+                    lease_acquired_at=null,heartbeat_at=null,
+                    current_step_attempt_id=null,
+                    completed_at=:completedAt,last_error_code=null,last_error_message=null,
+                    version=version+1,updated_at=:committedAt
+                where hospital_id=:hospitalId and id=:taskId
+                  and status='RUNNING' and execution_token=:executionToken
+                  and current_step_attempt_id=:attemptId
+                  and current_step=:stepCode and cancel_requested=false
+                """)
+                .param("nextStep", transition.nextStep())
+                .param("nextStatus", transition.nextStatus())
+                .param("outputJson", transition.outputJson())
+                .param("completedAt", timestamp(transition.completedAt()))
+                .param("committedAt", Timestamp.from(committedAt))
+                .param("hospitalId", claim.hospitalId())
+                .param("taskId", claim.taskId())
+                .param("executionToken", claim.executionToken())
+                .param("attemptId", claim.stepAttemptId())
+                .param("stepCode", claim.stepCode())
+                .update();
+        if (taskUpdated != 1) {
+            throw new IllegalStateException("Agent任务执行令牌在事务中失效");
+        }
+        List<EventData> committedEvents = insertPendingEvents(
+                claim.hospitalId(), claim.taskId(), events, committedAt);
+        TaskData current = findById(claim.hospitalId(), claim.taskId()).orElseThrow();
+        return new CommitOutcome(CommitStatus.APPLIED, current, committedEvents);
+    }
+
+    @Override
+    @Transactional
+    public CommitOutcome failClaim(
+            ClaimHandle claim, String errorCode, String errorMessage,
+            PendingEvent event, Instant committedAt) {
+        Optional<TaskData> locked = lockActiveClaim(claim);
+        if (locked.isEmpty()) {
+            return completedOrStale(claim, "FAILED", List.of(event));
+        }
+        String safeMessage = truncate(errorMessage);
+        int attemptUpdated = jdbc.sql("""
+                update ai_agent_step_attempt
+                set status='FAILED',completed_at=:committedAt,
+                    heartbeat_at=:committedAt,error_code=:errorCode,
+                    error_message=:errorMessage
+                where id=:attemptId and execution_token=:executionToken
+                  and status='RUNNING'
+                """)
+                .param("committedAt", Timestamp.from(committedAt))
+                .param("errorCode", errorCode)
+                .param("errorMessage", safeMessage)
+                .param("attemptId", claim.stepAttemptId())
+                .param("executionToken", claim.executionToken())
+                .update();
+        if (attemptUpdated != 1) {
+            throw new IllegalStateException("Agent步骤尝试当前不可失败");
+        }
+        int taskUpdated = jdbc.sql("""
+                update ai_agent_task
+                set status='FAILED',lease_until=null,execution_token=null,
+                    lease_owner=null,lease_acquired_at=null,heartbeat_at=null,
+                    current_step_attempt_id=null,last_error_code=:errorCode,
+                    last_error_message=:errorMessage,version=version+1,
+                    updated_at=:committedAt
+                where hospital_id=:hospitalId and id=:taskId
+                  and status='RUNNING' and execution_token=:executionToken
+                  and current_step_attempt_id=:attemptId
+                  and current_step=:stepCode and cancel_requested=false
+                """)
+                .param("errorCode", errorCode)
+                .param("errorMessage", safeMessage)
+                .param("committedAt", Timestamp.from(committedAt))
+                .param("hospitalId", claim.hospitalId())
+                .param("taskId", claim.taskId())
+                .param("executionToken", claim.executionToken())
+                .param("attemptId", claim.stepAttemptId())
+                .param("stepCode", claim.stepCode())
+                .update();
+        if (taskUpdated != 1) {
+            throw new IllegalStateException("Agent任务执行令牌在失败事务中失效");
+        }
+        List<EventData> committedEvents = insertPendingEvents(
+                claim.hospitalId(), claim.taskId(), List.of(event), committedAt);
+        TaskData current = findById(claim.hospitalId(), claim.taskId()).orElseThrow();
+        return new CommitOutcome(CommitStatus.APPLIED, current, committedEvents);
+    }
+
+    @Override
+    @Transactional
+    public CommitOutcome failTimedOut(
+            UUID hospitalId, UUID taskId, long expectedVersion, Instant now,
+            PendingEvent event) {
+        Optional<TaskData> locked = jdbc.sql("select " + TASK_COLUMNS + """
+                        from ai_agent_task
+                        where hospital_id=:hospitalId and id=:taskId
+                          and version=:expectedVersion
+                          and cancel_requested=false and timeout_at<=:now
+                          and status in ('QUEUED','RUNNING')
+                        for update
+                        """)
+                .param("hospitalId", hospitalId)
+                .param("taskId", taskId)
+                .param("expectedVersion", expectedVersion)
+                .param("now", Timestamp.from(now))
+                .query(this::mapTask).optional();
+        if (locked.isEmpty()) {
+            return new CommitOutcome(
+                    CommitStatus.STALE_TOKEN,
+                    findById(hospitalId, taskId).orElse(null), List.of());
+        }
+        jdbc.sql("""
+                update ai_agent_step_attempt
+                set status='FAILED',completed_at=:now,error_code='TASK_TIMEOUT',
+                    error_message='Agent任务执行超时'
+                where id=(
+                    select current_step_attempt_id from ai_agent_task
+                    where hospital_id=:hospitalId and id=:taskId
+                      and status not in ('COMPLETED','CANCELLED')
+                ) and status='RUNNING'
+                """)
+                .param("now", Timestamp.from(now))
+                .param("hospitalId", hospitalId)
+                .param("taskId", taskId)
+                .update();
+        jdbc.sql("""
+                update ai_agent_task
+                set status='FAILED',lease_until=null,execution_token=null,
+                    lease_owner=null,lease_acquired_at=null,heartbeat_at=null,
+                    current_step_attempt_id=null,last_error_code='TASK_TIMEOUT',
+                    last_error_message='Agent任务执行超时',version=version+1,
+                    updated_at=:now
+                where hospital_id=:hospitalId and id=:taskId
+                  and version=:expectedVersion
+                """)
+                .param("now", Timestamp.from(now))
+                .param("hospitalId", hospitalId)
+                .param("taskId", taskId)
+                .param("expectedVersion", expectedVersion)
+                .update();
+        List<EventData> committedEvents = insertPendingEvents(
+                hospitalId, taskId, List.of(event), now);
+        TaskData current = findById(hospitalId, taskId).orElseThrow();
+        return new CommitOutcome(CommitStatus.APPLIED, current, committedEvents);
     }
 
     @Override
@@ -495,6 +878,32 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
     }
 
     @Override
+    public boolean updateProtocolRevisionOutput(
+            UUID hospitalId,
+            UUID taskId,
+            long expectedVersion,
+            String outputJson,
+            Instant updatedAt) {
+        return jdbc.sql("""
+                update ai_agent_task
+                set output_json=cast(:outputJson as jsonb),
+                    version=version+1,
+                    updated_at=:updatedAt
+                where hospital_id=:hospitalId
+                  and id=:taskId
+                  and current_step='STEP_17_WAIT_EXPERT_REVIEW'
+                  and status='REVISION_REQUIRED'
+                  and version=:expectedVersion
+                """)
+                .param("outputJson", outputJson)
+                .param("updatedAt", Timestamp.from(updatedAt))
+                .param("hospitalId", hospitalId)
+                .param("taskId", taskId)
+                .param("expectedVersion", expectedVersion)
+                .update() == 1;
+    }
+
+    @Override
     @Transactional
     public boolean advanceToExport(
             UUID hospitalId, UUID taskId, UUID confirmedBy, Instant confirmedAt) {
@@ -600,9 +1009,24 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
     }
 
     @Override
+    @Transactional
     public boolean cancel(UUID hospitalId, UUID taskId, Instant completedAt) {
+        jdbc.sql("""
+                update ai_agent_step_attempt
+                set status='CANCELLED',completed_at=:completedAt,
+                    error_code='TASK_CANCELLED',error_message='任务已取消'
+                where id=(
+                    select current_step_attempt_id from ai_agent_task
+                    where hospital_id=:hospitalId and id=:taskId
+                ) and status='RUNNING'
+                """)
+                .param("completedAt", Timestamp.from(completedAt))
+                .param("hospitalId", hospitalId).param("taskId", taskId)
+                .update();
         return jdbc.sql("""
                 update ai_agent_task set status='CANCELLED',cancel_requested=true,lease_until=null,
+                    execution_token=null,lease_owner=null,lease_acquired_at=null,
+                    heartbeat_at=null,current_step_attempt_id=null,
                     completed_at=:completedAt,version=version+1,updated_at=current_timestamp
                 where hospital_id=:hospitalId and id=:taskId
                   and status not in ('COMPLETED','CANCELLED')
@@ -614,6 +1038,8 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
     public boolean retry(UUID hospitalId, UUID taskId, Instant timeoutAt) {
         return jdbc.sql("""
                 update ai_agent_task set status='QUEUED',cancel_requested=false,lease_until=null,
+                    execution_token=null,lease_owner=null,lease_acquired_at=null,
+                    heartbeat_at=null,current_step_attempt_id=null,
                     timeout_at=:timeoutAt,completed_at=null,last_error_code=null,last_error_message=null,
                     version=version+1,updated_at=current_timestamp
                 where hospital_id=:hospitalId and id=:taskId and status='FAILED'
@@ -623,18 +1049,23 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
 
     @Override
     public void saveStep(StepData step) {
+        insertStep(step, null);
+    }
+
+    private void insertStep(StepData step, UUID stepAttemptId) {
         jdbc.sql("""
                 insert into ai_agent_step_run(
                     id,hospital_id,task_id,step_code,attempt_no,status,input_schema_version,
                     output_schema_version,input_json,output_json,model_call_id,prompt_version,
                     tool_calls_json,error_code,error_message,
-                    started_at,completed_at,requires_confirmation,confirmed_by,confirmed_at
+                    started_at,completed_at,requires_confirmation,confirmed_by,confirmed_at,
+                    step_attempt_id
                 ) values(
                     :id,:hospitalId,:taskId,:stepCode,:attemptNo,:status,:inputSchemaVersion,
                     :outputSchemaVersion,cast(:inputJson as jsonb),cast(:outputJson as jsonb),
                     :modelCallId,:promptVersion,cast(:toolCallsJson as jsonb),
                     :errorCode,:errorMessage,:startedAt,:completedAt,:requiresConfirmation,
-                    :confirmedBy,:confirmedAt
+                    :confirmedBy,:confirmedAt,:stepAttemptId
                 )
                 """).param("id", step.id()).param("hospitalId", step.hospitalId())
                 .param("taskId", step.taskId()).param("stepCode", step.stepCode())
@@ -649,6 +1080,7 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
                 .param("completedAt", timestamp(step.completedAt()))
                 .param("requiresConfirmation", step.requiresConfirmation())
                 .param("confirmedBy", step.confirmedBy()).param("confirmedAt", timestamp(step.confirmedAt()))
+                .param("stepAttemptId", stepAttemptId)
                 .update();
     }
 
@@ -657,14 +1089,99 @@ public class JdbcAgentWorkflowRepository implements AgentWorkflowRepository {
                                  String stepCode, String payloadJson, Instant occurredAt) {
         return jdbc.sql("""
                 insert into ai_agent_event(
-                    hospital_id,task_id,event_type,step_code,payload_json,occurred_at
+                    hospital_id,task_id,event_key,event_type,step_code,payload_json,occurred_at
                 ) values(
-                    :hospitalId,:taskId,:eventType,:stepCode,cast(:payloadJson as jsonb),:occurredAt
+                    :hospitalId,:taskId,:eventKey,:eventType,:stepCode,
+                    cast(:payloadJson as jsonb),:occurredAt
                 ) returning id,hospital_id,task_id,event_type,step_code,payload_json::text,occurred_at
                 """).param("hospitalId", hospitalId).param("taskId", taskId)
+                .param("eventKey", "direct:" + UUID.randomUUID())
                 .param("eventType", eventType).param("stepCode", stepCode)
                 .param("payloadJson", payloadJson).param("occurredAt", Timestamp.from(occurredAt))
                 .query(this::mapEvent).single();
+    }
+
+    private Optional<TaskData> lockActiveClaim(ClaimHandle claim) {
+        return jdbc.sql("select " + TASK_COLUMNS + """
+                        from ai_agent_task
+                        where hospital_id=:hospitalId and id=:taskId
+                          and status='RUNNING' and cancel_requested=false
+                          and current_step=:stepCode
+                          and execution_token=:executionToken
+                          and current_step_attempt_id=:attemptId
+                        for update
+                        """)
+                .param("hospitalId", claim.hospitalId())
+                .param("taskId", claim.taskId())
+                .param("stepCode", claim.stepCode())
+                .param("executionToken", claim.executionToken())
+                .param("attemptId", claim.stepAttemptId())
+                .query(this::mapTask).optional();
+    }
+
+    private CommitOutcome completedOrStale(
+            ClaimHandle claim, String completedStatus, List<PendingEvent> pendingEvents) {
+        Optional<String> attemptStatus = jdbc.sql("""
+                        select status from ai_agent_step_attempt
+                        where id=:attemptId and execution_token=:executionToken
+                        """)
+                .param("attemptId", claim.stepAttemptId())
+                .param("executionToken", claim.executionToken())
+                .query(String.class).optional();
+        TaskData current = findById(claim.hospitalId(), claim.taskId()).orElse(null);
+        if (attemptStatus.filter(completedStatus::equals).isEmpty()) {
+            return new CommitOutcome(CommitStatus.STALE_TOKEN, current, List.of());
+        }
+        return new CommitOutcome(
+                CommitStatus.ALREADY_APPLIED, current,
+                findEventsByKeys(claim.hospitalId(), claim.taskId(), pendingEvents));
+    }
+
+    private List<EventData> insertPendingEvents(
+            UUID hospitalId, UUID taskId, List<PendingEvent> pendingEvents,
+            Instant occurredAt) {
+        for (PendingEvent event : pendingEvents) {
+            jdbc.sql("""
+                    insert into ai_agent_event(
+                        hospital_id,task_id,event_key,event_type,step_code,
+                        payload_json,occurred_at
+                    ) values(
+                        :hospitalId,:taskId,:eventKey,:eventType,:stepCode,
+                        cast(:payloadJson as jsonb),:occurredAt
+                    )
+                    on conflict (hospital_id,task_id,event_key) do nothing
+                    """)
+                    .param("hospitalId", hospitalId)
+                    .param("taskId", taskId)
+                    .param("eventKey", event.stableKey())
+                    .param("eventType", event.eventType())
+                    .param("stepCode", event.stepCode())
+                    .param("payloadJson", event.payloadJson())
+                    .param("occurredAt", Timestamp.from(occurredAt))
+                    .update();
+        }
+        return findEventsByKeys(hospitalId, taskId, pendingEvents);
+    }
+
+    private List<EventData> findEventsByKeys(
+            UUID hospitalId, UUID taskId, List<PendingEvent> pendingEvents) {
+        List<EventData> result = new ArrayList<>();
+        for (PendingEvent event : pendingEvents) {
+            jdbc.sql("""
+                    select id,hospital_id,task_id,event_type,step_code,
+                           payload_json::text,occurred_at
+                    from ai_agent_event
+                    where hospital_id=:hospitalId and task_id=:taskId
+                      and event_key=:eventKey
+                    """)
+                    .param("hospitalId", hospitalId)
+                    .param("taskId", taskId)
+                    .param("eventKey", event.stableKey())
+                    .query(this::mapEvent).optional()
+                    .ifPresent(result::add);
+        }
+        result.sort(java.util.Comparator.comparingLong(EventData::id));
+        return List.copyOf(result);
     }
 
     @Override

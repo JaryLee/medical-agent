@@ -2,6 +2,8 @@ package com.jarylee.medicalagent.agent;
 
 import com.jarylee.medicalagent.agent.mock.MockModelRouter;
 import com.jarylee.medicalagent.agent.mock.MockResearchModel;
+import com.jarylee.medicalagent.agent.model.ResearchModel;
+import com.jarylee.medicalagent.agent.prompt.PromptTemplateRegistry.VersionedPrompt;
 import com.jarylee.medicalagent.document.ControlledDocxService;
 import com.jarylee.medicalagent.literature.MockPubMedGateway;
 import com.jarylee.medicalagent.agent.prompt.PromptTemplateRegistry;
@@ -9,6 +11,7 @@ import org.apache.poi.xwpf.usermodel.XWPFDocument;
 import org.junit.jupiter.api.Test;
 
 import java.io.ByteArrayInputStream;
+import java.util.ArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -42,6 +45,32 @@ class PrototypeServiceTest {
 
         assertThat(result.peco().schemaVersion()).isEqualTo("peco/v1");
         assertThat(result.selectedDirection().id()).isEqualTo("DIR-02");
+    }
+
+    @Test
+    void usesStepSpecificPromptsAndDoesNotRegenerateAConfirmedDirection() {
+        var promptSteps = new ArrayList<String>();
+        ResearchModel recordingModel = new MockResearchModel() {
+            @Override
+            public com.jarylee.medicalagent.agent.model.ResearchModels.AnalysisResult
+                    analyzeIdea(String idea, VersionedPrompt prompt) {
+                promptSteps.add(prompt.stepCode());
+                return super.analyzeIdea(idea, prompt);
+            }
+        };
+        PrototypeService audited = new PrototypeService(
+                ignored -> recordingModel, new MockPubMedGateway(),
+                new ControlledDocxService(), new ResearchOutputValidator(),
+                new PromptTemplateRegistry());
+
+        var initial = audited.analyzeIdea(IDEA);
+        var directions = audited.generateDirections(IDEA + "\n已确认补充信息：匿名门诊数据");
+        var question = audited.buildResearchQuestion(directions, "DIR-02");
+
+        assertThat(initial.profile()).isNotNull();
+        assertThat(question.selectedDirection()).isSameAs(directions.directions().get(1));
+        assertThat(promptSteps).containsExactly(
+                "STEP_01_PARSE_IDEA", "STEP_04_GENERATE_RESEARCH_DIRECTIONS");
     }
 
     @Test

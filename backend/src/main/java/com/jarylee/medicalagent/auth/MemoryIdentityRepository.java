@@ -21,8 +21,9 @@ public class MemoryIdentityRepository implements IdentityRepository {
 
     @Override
     public Optional<HospitalData> findHospitalByCode(String code) {
+        String normalized = IdentityNormalizer.hospitalCode(code);
         return store.hospitals.values().stream()
-                .filter(row -> row.code().equalsIgnoreCase(code)).findFirst().map(this::hospital);
+                .filter(row -> row.code().equals(normalized)).findFirst().map(this::hospital);
     }
 
     @Override
@@ -39,14 +40,16 @@ public class MemoryIdentityRepository implements IdentityRepository {
     @Override
     public void insertHospital(HospitalData hospital) {
         store.hospitals.put(hospital.id(), new PlatformStore.HospitalRow(
-                hospital.id(), hospital.code(), hospital.name(), hospital.createdAt()));
+                hospital.id(), IdentityNormalizer.hospitalCode(hospital.code()),
+                hospital.name(), hospital.createdAt()));
     }
 
     @Override
     public Optional<UserData> findUser(UUID hospitalId, String username) {
+        String normalized = IdentityNormalizer.usernameLookup(username);
         return store.users.values().stream()
                 .filter(row -> Objects.equals(row.hospitalId, hospitalId)
-                        && row.username.equalsIgnoreCase(username))
+                        && IdentityNormalizer.usernameLookup(row.username).equals(normalized))
                 .findFirst().map(this::user);
     }
 
@@ -56,13 +59,30 @@ public class MemoryIdentityRepository implements IdentityRepository {
     }
 
     @Override
+    public Optional<UserData> findUserById(UUID hospitalId, UUID id) {
+        return Optional.ofNullable(store.users.get(id))
+                .filter(row -> Objects.equals(row.hospitalId, hospitalId))
+                .map(this::user);
+    }
+
+    @Override
     public List<UserData> findUsers() {
         return store.users.values().stream().map(this::user).toList();
     }
 
     @Override
+    public List<UserData> findUsers(UUID hospitalId) {
+        return store.users.values().stream()
+                .filter(row -> Objects.equals(row.hospitalId, hospitalId))
+                .map(this::user)
+                .toList();
+    }
+
+    @Override
     public void insertUser(UserData user) {
-        var row = new PlatformStore.UserRow(user.id(), user.hospitalId(), user.username(),
+        var row = new PlatformStore.UserRow(
+                user.id(), user.hospitalId(),
+                IdentityNormalizer.username(user.username()),
                 user.passwordHash(), user.roles());
         apply(row, user);
         store.users.put(row.id, row);

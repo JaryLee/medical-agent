@@ -3,6 +3,7 @@ package com.jarylee.medicalagent.workflow;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jarylee.medicalagent.agent.model.ResearchModels.ResearchIdeaProfile;
+import com.jarylee.medicalagent.agent.model.ResearchModels.ResearchDirection;
 import com.jarylee.medicalagent.agent.model.ResearchModels.StudyType;
 import com.jarylee.medicalagent.audit.AuditService;
 import com.jarylee.medicalagent.auth.AuthenticatedUser;
@@ -13,6 +14,9 @@ import com.jarylee.medicalagent.literature.SearchStrategyService.SearchStrategy;
 import com.jarylee.medicalagent.research.ResearchProjectService;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.time.Clock;
@@ -55,6 +59,7 @@ public class AgentWorkflowService {
         this.observationalDesign = observationalDesign;
     }
 
+    @Transactional
     public TaskView create(UUID projectId, String idea, String idempotencyKey) {
         AuthenticatedUser actor = requireReadyUser();
         if (idempotencyKey == null || idempotencyKey.isBlank()) {
@@ -66,7 +71,7 @@ public class AgentWorkflowService {
         if (existing.isPresent()) return view(existing.get());
 
         Instant now = clock.instant();
-        String inputJson = write(new TaskInput(idea.strip(), Map.of(), null));
+        String inputJson = write(new TaskInput(idea.strip(), Map.of(), null, null, null));
         var task = new AgentWorkflowRepository.TaskData(
                 UUID.randomUUID(), actor.hospitalId(), projectId, actor.userId(),
                 "STEP_01_PARSE_IDEA", "QUEUED", inputJson, null, null,
@@ -89,22 +94,37 @@ public class AgentWorkflowService {
                 .map(this::view).toList();
     }
 
-    public TaskView confirm(UUID taskId, String directionId) {
+    @Transactional
+    public TaskView confirm(
+            UUID taskId, String directionId, UUID candidateSetId, String candidateSetHash) {
         AuthenticatedUser actor = requireReadyUser();
         var task = requireEditableTask(actor, taskId);
+        JsonNode output = readTree(task.outputJson());
+        if (output == null
+                || !candidateSetId.toString().equals(output.path("candidateSetId").asText())
+                || !candidateSetHash.equals(output.path("candidateSetHash").asText())) {
+            throw BusinessException.conflict("研究方向候选集已变化，请刷新后重新确认");
+        }
+        JsonNode directions = output.get("directions");
+        if (directions == null || !directions.isArray()
+                || !containsDirection(directions, directionId)) {
+            throw BusinessException.conflict("所选研究方向不属于当前候选集");
+        }
         TaskInput input = read(task.inputJson(), TaskInput.class);
         Instant now = clock.instant();
         boolean updated = repository.confirm(actor.hospitalId(), taskId,
-                write(new TaskInput(input.idea(), answers(input), directionId)),
+                write(new TaskInput(input.idea(), answers(input), directionId,
+                        candidateSetId, candidateSetHash)),
                 actor.userId(), now, now.plus(taskTimeout));
         if (!updated) throw BusinessException.conflict("任务当前不可确认");
         var current = requireTask(actor, taskId);
         publish(current, "DIRECTION_CONFIRMED", "STEP_05_CONFIRM_DIRECTION",
-                write(new DirectionPayload(directionId)));
+                write(new DirectionPayload(directionId, candidateSetId, candidateSetHash)));
         audit.record(actor, "AGENT_DIRECTION_CONFIRMED", "AI_AGENT_TASK", taskId.toString());
         return view(current);
     }
 
+    @Transactional
     public TaskView submitClarifications(UUID taskId, Map<String, String> submittedAnswers) {
         AuthenticatedUser actor = requireReadyUser();
         var task = requireEditableTask(actor, taskId);
@@ -122,7 +142,7 @@ public class AgentWorkflowService {
         Instant now = clock.instant();
         var round = repository.confirmClarifications(
                 actor.hospitalId(), taskId, sourceStep,
-                write(new TaskInput(input.idea(), Map.copyOf(effectiveAnswers), null)),
+                write(new TaskInput(input.idea(), Map.copyOf(effectiveAnswers), null, null, null)),
                 write(questions), write(effectiveAnswers), actor.userId(), now,
                 now.plus(taskTimeout))
                 .orElseThrow(() -> BusinessException.conflict("澄清答案已被其他请求提交"));
@@ -147,6 +167,7 @@ public class AgentWorkflowService {
                 .toList();
     }
 
+    @Transactional
     public TaskView confirmSearchStrategy(UUID taskId, String pubmedQuery) {
         AuthenticatedUser actor = requireReadyUser();
         var task = requireEditableTask(actor, taskId);
@@ -178,6 +199,7 @@ public class AgentWorkflowService {
         return view(current);
     }
 
+    @Transactional
     public TaskView confirmObservationalDesign(
             UUID taskId,
             StudyType studyType,
@@ -235,6 +257,7 @@ public class AgentWorkflowService {
         return view(current);
     }
 
+    @Transactional
     public TaskView cancel(UUID taskId) {
         AuthenticatedUser actor = requireReadyUser();
         requireEditableTask(actor, taskId);
@@ -247,6 +270,7 @@ public class AgentWorkflowService {
         return view(current);
     }
 
+    @Transactional
     public TaskView retry(UUID taskId) {
         AuthenticatedUser actor = requireReadyUser();
         requireEditableTask(actor, taskId);
@@ -271,7 +295,21 @@ public class AgentWorkflowService {
                  String stepCode, String payloadJson) {
         var event = repository.appendEvent(task.hospitalId(), task.id(), eventType,
                 stepCode, payloadJson, clock.instant());
-        eventStream.publish(event);
+        if (TransactionSynchronizationManager.isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            eventStream.publish(event);
+                        }
+                    });
+        } else {
+            eventStream.publish(event);
+        }
+    }
+
+    void publishCommitted(List<AgentWorkflowRepository.EventData> events) {
+        events.forEach(eventStream::publish);
     }
 
     private AgentWorkflowRepository.TaskData requireTask(AuthenticatedUser actor, UUID taskId) {
@@ -365,13 +403,25 @@ public class AgentWorkflowService {
         return input.clarificationAnswers() == null ? Map.of() : input.clarificationAnswers();
     }
 
+    private boolean containsDirection(JsonNode directions, String directionId) {
+        for (JsonNode direction : directions) {
+            if (directionId.equals(direction.path("id").asText())) return true;
+        }
+        return false;
+    }
+
     public record TaskInput(String idea, Map<String, String> clarificationAnswers,
-                            String directionId) {}
+                            String directionId, UUID directionCandidateSetId,
+                            String directionCandidateSetHash) {}
     public record ClarificationOutput(ResearchIdeaProfile profile,
                                       List<String> clarificationQuestions,
                                       String disclaimer) {}
     public record StatusPayload(String status) {}
-    public record DirectionPayload(String directionId) {}
+    public record DirectionPayload(
+            String directionId, UUID candidateSetId, String candidateSetHash) {}
+    public record DirectionCandidateSetPayload(
+            UUID candidateSetId, String candidateSetHash,
+            List<ResearchDirection> directions) {}
     public record ClarificationPayload(int roundNo, int answerCount, boolean directionRevision) {}
     public record ClarificationRoundView(
             UUID id, int roundNo, String sourceStep, JsonNode questions, JsonNode answers,

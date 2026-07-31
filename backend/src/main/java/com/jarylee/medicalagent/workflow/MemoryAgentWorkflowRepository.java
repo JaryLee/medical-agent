@@ -1,9 +1,12 @@
 package com.jarylee.medicalagent.workflow;
 
+import com.jarylee.medicalagent.workspace.WorkspaceRepository;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Profile;
 import org.springframework.stereotype.Repository;
 
 import java.time.Instant;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -16,12 +19,26 @@ import java.util.concurrent.atomic.AtomicLong;
 @Repository
 @Profile("memory")
 public class MemoryAgentWorkflowRepository implements AgentWorkflowRepository {
+    private final WorkspaceRepository workspace;
     private final Map<UUID, TaskData> tasks = new ConcurrentHashMap<>();
     private final Map<String, UUID> idempotency = new ConcurrentHashMap<>();
     private final List<StepData> steps = new ArrayList<>();
     private final List<EventData> events = new ArrayList<>();
     private final List<ClarificationRoundData> clarificationRounds = new ArrayList<>();
     private final AtomicLong eventSequence = new AtomicLong();
+    private final Map<UUID, ClaimHandle> activeClaims = new ConcurrentHashMap<>();
+    private final Map<String, Integer> attemptSequences = new ConcurrentHashMap<>();
+    private final Map<UUID, String> attemptStatuses = new ConcurrentHashMap<>();
+    private final Map<String, EventData> eventsByStableKey = new ConcurrentHashMap<>();
+
+    public MemoryAgentWorkflowRepository() {
+        this.workspace = null;
+    }
+
+    @Autowired
+    public MemoryAgentWorkflowRepository(WorkspaceRepository workspace) {
+        this.workspace = workspace;
+    }
 
     @Override
     public Optional<TaskData> findById(UUID hospitalId, UUID taskId) {
@@ -34,8 +51,21 @@ public class MemoryAgentWorkflowRepository implements AgentWorkflowRepository {
         return tasks.values().stream()
                 .filter(task -> task.hospitalId().equals(hospitalId)
                         && task.projectId().equals(projectId))
-                .sorted(Comparator.comparing(TaskData::createdAt).reversed())
+                .sorted(Comparator.comparing(TaskData::createdAt)
+                        .thenComparing(TaskData::id)
+                        .reversed())
                 .toList();
+    }
+
+    @Override
+    public synchronized Optional<StepData> findLatestStep(
+            UUID hospitalId, UUID taskId, String stepCode) {
+        return steps.stream()
+                .filter(step -> step.hospitalId().equals(hospitalId)
+                        && step.taskId().equals(taskId)
+                        && step.stepCode().equals(stepCode))
+                .max(Comparator.comparingInt(StepData::attemptNo)
+                        .thenComparing(StepData::startedAt));
     }
 
     @Override
@@ -70,6 +100,131 @@ public class MemoryAgentWorkflowRepository implements AgentWorkflowRepository {
                 .filter(task -> List.of("QUEUED", "RUNNING").contains(task.status()))
                 .filter(task -> !task.cancelRequested() && !task.timeoutAt().isAfter(now))
                 .limit(limit).toList();
+    }
+
+    @Override
+    public synchronized Optional<ClaimedTask> claimNext(
+            Instant now, String leaseOwner, Duration leaseDuration) {
+        Optional<TaskData> candidate = findRunnable(now, 1).stream().findFirst();
+        if (candidate.isEmpty()) return Optional.empty();
+        TaskData task = candidate.get();
+        UUID token = UUID.randomUUID();
+        String attemptKey = task.id() + "|" + task.currentStep();
+        int attemptNo = attemptSequences.merge(attemptKey, 1, Integer::sum);
+        ClaimHandle handle = new ClaimHandle(
+                task.hospitalId(), task.id(), task.currentStep(), token,
+                UUID.randomUUID(), attemptNo, leaseOwner);
+        ClaimHandle previous = activeClaims.get(task.id());
+        if (previous != null) {
+            attemptStatuses.put(previous.stepAttemptId(), "LEASE_LOST");
+        }
+        TaskData claimed = copy(
+                task, task.currentStep(), "RUNNING", task.inputJson(), task.outputJson(),
+                now.plus(leaseDuration), task.timeoutAt(), task.cancelRequested(),
+                task.version() + 1, null, null, task.completedAt());
+        tasks.put(task.id(), claimed);
+        activeClaims.put(task.id(), handle);
+        attemptStatuses.put(handle.stepAttemptId(), "RUNNING");
+        List<EventData> started = appendPendingEvents(
+                task.hospitalId(), task.id(),
+                List.of(new PendingEvent(
+                        handle.stepAttemptId() + ":started", "TASK_STARTED",
+                        task.currentStep(), "{\"status\":\"RUNNING\"}")),
+                now);
+        return Optional.of(new ClaimedTask(claimed, handle, started));
+    }
+
+    @Override
+    public synchronized boolean heartbeat(
+            ClaimHandle claim, Instant leaseUntil, Instant heartbeatAt) {
+        ClaimHandle current = activeClaims.get(claim.taskId());
+        TaskData task = tasks.get(claim.taskId());
+        if (!claim.equals(current) || task == null || !"RUNNING".equals(task.status())) {
+            return false;
+        }
+        tasks.put(task.id(), copy(
+                task, task.currentStep(), task.status(), task.inputJson(), task.outputJson(),
+                leaseUntil, task.timeoutAt(), task.cancelRequested(), task.version(),
+                task.lastErrorCode(), task.lastErrorMessage(), task.completedAt()));
+        return true;
+    }
+
+    @Override
+    public synchronized CommitOutcome commitClaim(
+            ClaimHandle claim, List<StepData> committedSteps,
+            TaskTransition transition, List<PendingEvent> pendingEvents,
+            Instant committedAt) {
+        if (!claim.equals(activeClaims.get(claim.taskId()))) {
+            return completedOrStale(claim, "COMPLETED", pendingEvents);
+        }
+        TaskData task = tasks.get(claim.taskId());
+        if (task == null || !task.hospitalId().equals(claim.hospitalId())
+                || !"RUNNING".equals(task.status())
+                || !claim.stepCode().equals(task.currentStep())
+                || task.cancelRequested()) {
+            return new CommitOutcome(CommitStatus.STALE_TOKEN, task, List.of());
+        }
+        steps.addAll(committedSteps);
+        attemptStatuses.put(claim.stepAttemptId(), "COMPLETED");
+        activeClaims.remove(claim.taskId(), claim);
+        TaskData current = copy(
+                task, transition.nextStep(), transition.nextStatus(),
+                task.inputJson(), transition.outputJson(), null, task.timeoutAt(),
+                false, task.version() + 1, null, null, transition.completedAt());
+        tasks.put(task.id(), current);
+        return new CommitOutcome(
+                CommitStatus.APPLIED, current,
+                appendPendingEvents(claim.hospitalId(), claim.taskId(),
+                        pendingEvents, committedAt));
+    }
+
+    @Override
+    public synchronized CommitOutcome failClaim(
+            ClaimHandle claim, String errorCode, String errorMessage,
+            PendingEvent event, Instant committedAt) {
+        if (!claim.equals(activeClaims.get(claim.taskId()))) {
+            return completedOrStale(claim, "FAILED", List.of(event));
+        }
+        TaskData task = tasks.get(claim.taskId());
+        if (task == null || task.cancelRequested() || !"RUNNING".equals(task.status())) {
+            return new CommitOutcome(CommitStatus.STALE_TOKEN, task, List.of());
+        }
+        attemptStatuses.put(claim.stepAttemptId(), "FAILED");
+        activeClaims.remove(claim.taskId(), claim);
+        TaskData current = copy(
+                task, task.currentStep(), "FAILED", task.inputJson(), task.outputJson(),
+                null, task.timeoutAt(), false, task.version() + 1,
+                errorCode, truncate(errorMessage), task.completedAt());
+        tasks.put(task.id(), current);
+        return new CommitOutcome(
+                CommitStatus.APPLIED, current,
+                appendPendingEvents(claim.hospitalId(), claim.taskId(),
+                        List.of(event), committedAt));
+    }
+
+    @Override
+    public synchronized CommitOutcome failTimedOut(
+            UUID hospitalId, UUID taskId, long expectedVersion, Instant now,
+            PendingEvent event) {
+        TaskData task = tasks.get(taskId);
+        if (task == null || !task.hospitalId().equals(hospitalId)
+                || task.version() != expectedVersion || task.cancelRequested()
+                || task.timeoutAt().isAfter(now)
+                || !List.of("QUEUED", "RUNNING").contains(task.status())) {
+            return new CommitOutcome(CommitStatus.STALE_TOKEN, task, List.of());
+        }
+        ClaimHandle claim = activeClaims.remove(taskId);
+        if (claim != null) {
+            attemptStatuses.put(claim.stepAttemptId(), "FAILED");
+        }
+        TaskData current = copy(
+                task, task.currentStep(), "FAILED", task.inputJson(), task.outputJson(),
+                null, task.timeoutAt(), false, task.version() + 1,
+                "TASK_TIMEOUT", "Agent任务执行超时", task.completedAt());
+        tasks.put(taskId, current);
+        return new CommitOutcome(
+                CommitStatus.APPLIED, current,
+                appendPendingEvents(hospitalId, taskId, List.of(event), now));
     }
 
     @Override
@@ -284,6 +439,30 @@ public class MemoryAgentWorkflowRepository implements AgentWorkflowRepository {
     }
 
     @Override
+    public synchronized boolean updateProtocolRevisionOutput(
+            UUID hospitalId,
+            UUID taskId,
+            long expectedVersion,
+            String outputJson,
+            Instant updatedAt) {
+        var task = tasks.get(taskId);
+        if (task == null
+                || !task.hospitalId().equals(hospitalId)
+                || task.version() != expectedVersion
+                || !"STEP_17_WAIT_EXPERT_REVIEW".equals(
+                task.currentStep())
+                || !"REVISION_REQUIRED".equals(task.status())) {
+            return false;
+        }
+        tasks.put(taskId, copy(
+                task, task.currentStep(), task.status(),
+                task.inputJson(), outputJson, null,
+                task.timeoutAt(), false, task.version() + 1,
+                null, null, null));
+        return true;
+    }
+
+    @Override
     public synchronized boolean advanceToExport(
             UUID hospitalId, UUID taskId, UUID confirmedBy, Instant confirmedAt) {
         var task = tasks.get(taskId);
@@ -383,6 +562,8 @@ public class MemoryAgentWorkflowRepository implements AgentWorkflowRepository {
         tasks.put(taskId, copy(task, task.currentStep(), "CANCELLED", task.inputJson(),
                 task.outputJson(), null, task.timeoutAt(), true, task.version() + 1,
                 null, null, completedAt));
+        ClaimHandle claim = activeClaims.remove(taskId);
+        if (claim != null) attemptStatuses.put(claim.stepAttemptId(), "CANCELLED");
         return true;
     }
 
@@ -408,7 +589,60 @@ public class MemoryAgentWorkflowRepository implements AgentWorkflowRepository {
         var event = new EventData(eventSequence.incrementAndGet(), hospitalId, taskId,
                 eventType, stepCode, payloadJson, occurredAt);
         events.add(event);
+        recordWorkspaceChange(hospitalId, taskId, occurredAt);
         return event;
+    }
+
+    private CommitOutcome completedOrStale(
+            ClaimHandle claim, String completedStatus, List<PendingEvent> pendingEvents) {
+        TaskData current = tasks.get(claim.taskId());
+        if (!completedStatus.equals(attemptStatuses.get(claim.stepAttemptId()))) {
+            return new CommitOutcome(CommitStatus.STALE_TOKEN, current, List.of());
+        }
+        List<EventData> committedEvents = pendingEvents.stream()
+                .map(event -> eventsByStableKey.get(stableScope(
+                        claim.hospitalId(), claim.taskId(), event.stableKey())))
+                .filter(java.util.Objects::nonNull)
+                .sorted(Comparator.comparingLong(EventData::id))
+                .toList();
+        return new CommitOutcome(
+                CommitStatus.ALREADY_APPLIED, current, committedEvents);
+    }
+
+    private List<EventData> appendPendingEvents(
+            UUID hospitalId, UUID taskId, List<PendingEvent> pendingEvents,
+            Instant occurredAt) {
+        List<EventData> committed = new ArrayList<>();
+        for (PendingEvent pending : pendingEvents) {
+            String scope = stableScope(hospitalId, taskId, pending.stableKey());
+            EventData event = eventsByStableKey.get(scope);
+            if (event == null) {
+                event = new EventData(
+                        eventSequence.incrementAndGet(), hospitalId, taskId,
+                        pending.eventType(), pending.stepCode(),
+                        pending.payloadJson(), occurredAt);
+                eventsByStableKey.put(scope, event);
+                events.add(event);
+                recordWorkspaceChange(hospitalId, taskId, occurredAt);
+            }
+            committed.add(event);
+        }
+        committed.sort(Comparator.comparingLong(EventData::id));
+        return List.copyOf(committed);
+    }
+
+    private String stableScope(UUID hospitalId, UUID taskId, String stableKey) {
+        return hospitalId + "|" + taskId + "|" + stableKey;
+    }
+
+    private void recordWorkspaceChange(
+            UUID hospitalId, UUID taskId, Instant occurredAt) {
+        if (workspace == null) return;
+        TaskData task = tasks.get(taskId);
+        if (task != null && task.hospitalId().equals(hospitalId)) {
+            workspace.recordMemoryChange(
+                    hospitalId, task.projectId(), occurredAt);
+        }
     }
 
     @Override
@@ -424,6 +658,11 @@ public class MemoryAgentWorkflowRepository implements AgentWorkflowRepository {
             throw new IllegalStateException("Agent任务不存在");
         }
         tasks.put(taskId, updater.apply(task));
+    }
+
+    private String truncate(String message) {
+        if (message == null) return "未知错误";
+        return message.length() <= 500 ? message : message.substring(0, 500);
     }
 
     private TaskData copy(TaskData source, String step, String status, String inputJson,

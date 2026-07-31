@@ -13,10 +13,13 @@ import com.jarylee.medicalagent.review.ExpertReviewModels.Decision;
 import com.jarylee.medicalagent.review.ExpertReviewModels.ReviewAction;
 import com.jarylee.medicalagent.review.ExpertReviewModels.ReviewComment;
 import com.jarylee.medicalagent.review.ExpertReviewModels.ReviewView;
+import com.jarylee.medicalagent.review.ExpertReviewModels.Responsibility;
 import com.jarylee.medicalagent.workflow.AgentEventStream;
 import com.jarylee.medicalagent.workflow.AgentWorkflowRepository;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -60,17 +63,49 @@ public class ExpertReviewService {
             AgentWorkflowRepository.TaskData task,
             UUID protocolId,
             UUID strobeCheckTaskId) {
+        return open(task, protocolId, strobeCheckTaskId, task.outputJson());
+    }
+
+    @Transactional
+    public ReviewView open(
+            AgentWorkflowRepository.TaskData task,
+            UUID protocolId,
+            UUID strobeCheckTaskId,
+            String reviewContentJson) {
         var existing = reviews.findByAgentTask(task.hospitalId(), task.id());
-        if (existing.isPresent()) return view(existing.get());
+        String contentSha256 = ReviewContentHash.sha256(json, reviewContentJson);
         Instant now = clock.instant();
+        if (existing.isPresent()) {
+            var current = existing.get();
+            if (current.contentSha256().equals(contentSha256)
+                    && !"SUPERSEDED".equals(current.status())) {
+                return view(current);
+            }
+            var reset = reviews.resetForNewRound(
+                            task.hospitalId(), current.id(), contentSha256,
+                            now, current.version())
+                    .orElseThrow(() -> BusinessException.conflict(
+                            "审核轮次已变化，请刷新后重试"));
+            reviews.addAction(new ExpertReviewRepository.ReviewActionData(
+                    UUID.randomUUID(), task.hospitalId(), reset.id(),
+                    "REVIEW_SUPERSEDED", reset.roundNo(),
+                    task.createdBy(), "内容已变化，旧审核结论失效并创建新轮次。", now));
+            return view(reset);
+        }
+        int nextRound = reviews.findLatestByProject(
+                        task.hospitalId(), task.projectId())
+                .map(value -> value.roundNo() + 1)
+                .orElse(1);
         var created = reviews.create(new ExpertReviewRepository.ReviewTaskData(
                 UUID.randomUUID(), task.hospitalId(), task.projectId(), task.id(),
                 protocolId, strobeCheckTaskId, "WAITING_EXPERT_REVIEW",
-                task.createdBy(), now, null, null, null, null,
+                nextRound, contentSha256, false, task.createdBy(), now,
+                null, null, null, null,
+                null, null, null, null,
                 null, null, false, 0));
         reviews.addAction(new ExpertReviewRepository.ReviewActionData(
                 UUID.randomUUID(), task.hospitalId(), created.id(),
-                "REVIEW_OPENED", task.createdBy(),
+                "REVIEW_OPENED", created.roundNo(), task.createdBy(),
                 "STEP16 完成，已提交专家审核。", now));
         return view(created);
     }
@@ -89,6 +124,7 @@ public class ExpertReviewService {
             Integer protocolSectionVersionNo,
             UUID strobeItemResultId,
             CommentType commentType,
+            Responsibility responsibility,
             String content) {
         AuthenticatedUser actor = requireExpert();
         var task = requireTask(actor, agentTaskId);
@@ -97,15 +133,18 @@ public class ExpertReviewService {
         if (!"WAITING_EXPERT_REVIEW".equals(review.status())) {
             throw BusinessException.conflict("当前审核任务不再接受新批注");
         }
+        requireResponsibleReviewer(review, responsibility, actor);
         validateTarget(task, protocolSectionId, protocolSectionVersionNo, strobeItemResultId);
         Instant now = clock.instant();
         var comment = reviews.addComment(new ExpertReviewRepository.ReviewCommentData(
                 UUID.randomUUID(), actor.hospitalId(), review.id(),
                 protocolSectionId, protocolSectionVersionNo, strobeItemResultId,
-                commentType.name(), content.strip(), actor.userId(), now));
+                commentType.name(), responsibility.name(), review.roundNo(),
+                content.strip(), actor.userId(), now));
         reviews.addAction(new ExpertReviewRepository.ReviewActionData(
                 UUID.randomUUID(), actor.hospitalId(), review.id(), "COMMENT_ADDED",
-                actor.userId(), comment.commentType() + " 批注", now));
+                review.roundNo(), actor.userId(),
+                responsibility.name() + " " + comment.commentType() + " 批注", now));
         audit.record(actor, "EXPERT_REVIEW_COMMENT_ADDED",
                 "RESEARCH_REVIEW_TASK", review.id().toString());
         publish(task, "EXPERT_REVIEW_COMMENT_ADDED", write(comment));
@@ -115,6 +154,7 @@ public class ExpertReviewService {
     @Transactional
     public ReviewView decide(
             UUID agentTaskId,
+            Responsibility responsibility,
             Decision decision,
             String summary,
             long expectedVersion) {
@@ -122,28 +162,44 @@ public class ExpertReviewService {
         var task = requireTask(actor, agentTaskId);
         projects.get(task.projectId());
         var review = requireReview(actor.hospitalId(), agentTaskId);
+        requireResponsibleReviewer(review, responsibility, actor);
+        String contentSha256 = ReviewContentHash.sha256(json, task.outputJson());
+        if (!review.contentSha256().equals(contentSha256)) {
+            throw BusinessException.conflict("审核内容已变化，请创建新审核轮次");
+        }
         if (decision == Decision.RETURN_FOR_REVISION
-                && reviews.findComments(actor.hospitalId(), review.id()).isEmpty()) {
+                && reviews.findComments(actor.hospitalId(), review.id()).stream()
+                .noneMatch(comment -> comment.reviewRoundNo() == review.roundNo()
+                        && responsibility.name().equals(comment.responsibility())
+                        && actor.userId().equals(comment.createdBy()))) {
             throw new IllegalArgumentException("退回修改前至少需要一条可定位批注");
         }
         Instant now = clock.instant();
         var updated = reviews.decide(
-                        actor.hospitalId(), review.id(), actor.userId(),
-                        decision.name(), summary.strip(), now, expectedVersion)
+                        actor.hospitalId(), review.id(), responsibility.name(),
+                        actor.userId(),
+                        decision.name(), summary.strip(), contentSha256,
+                        now, expectedVersion)
                 .orElseThrow(() -> BusinessException.conflict(
                         "审核任务状态或版本已变化，请刷新后重试"));
-        String action = decision == Decision.APPROVE
-                ? "EXPERT_APPROVED" : "RETURNED_FOR_REVISION";
+        reviews.addDecision(new ExpertReviewRepository.ReviewDecisionData(
+                UUID.randomUUID(), actor.hospitalId(), review.id(),
+                review.roundNo(), responsibility.name(), actor.userId(),
+                decision.name(), summary.strip(), contentSha256, now));
+        String action = responsibility.name().replace("_REVIEW", "")
+                + (decision == Decision.APPROVE
+                    ? "_REVIEW_APPROVED" : "_REVIEW_RETURNED");
         reviews.addAction(new ExpertReviewRepository.ReviewActionData(
                 UUID.randomUUID(), actor.hospitalId(), review.id(), action,
-                actor.userId(), summary.strip(), now));
+                review.roundNo(), actor.userId(), summary.strip(), now));
         if (decision == Decision.RETURN_FOR_REVISION
                 && !workflows.markExpertReviewReturned(actor.hospitalId(), agentTaskId)) {
             throw BusinessException.conflict("Agent 任务当前不能退回修改");
         }
         audit.record(actor,
                 decision == Decision.APPROVE
-                        ? "EXPERT_REVIEW_APPROVED" : "EXPERT_REVIEW_RETURNED",
+                        ? responsibility.name() + "_APPROVED"
+                        : responsibility.name() + "_RETURNED",
                 "RESEARCH_REVIEW_TASK", review.id().toString());
         publish(task, action, write(updated));
         return view(updated);
@@ -155,10 +211,11 @@ public class ExpertReviewService {
         var task = requireTask(actor, agentTaskId);
         projects.requireOwner(task.projectId());
         var review = requireReview(actor.hospitalId(), agentTaskId);
+        String contentSha256 = ReviewContentHash.sha256(json, task.outputJson());
         Instant now = clock.instant();
         var approved = reviews.ownerConfirmAndLock(
                         actor.hospitalId(), review.id(), actor.userId(),
-                        now, expectedVersion)
+                        contentSha256, now, expectedVersion)
                 .orElseThrow(() -> BusinessException.conflict(
                         "只有专家审核通过且版本未变化时才能由课题负责人确认"));
         if (!workflows.advanceToExport(
@@ -167,7 +224,7 @@ public class ExpertReviewService {
         }
         reviews.addAction(new ExpertReviewRepository.ReviewActionData(
                 UUID.randomUUID(), actor.hospitalId(), review.id(),
-                "OWNER_CONFIRMED", actor.userId(),
+                "OWNER_CONFIRMED", review.roundNo(), actor.userId(),
                 "课题负责人确认专家审核结论并锁定当前章节版本。", now));
         audit.record(actor, "EXPERT_REVIEW_OWNER_CONFIRMED",
                 "RESEARCH_REVIEW_TASK", review.id().toString());
@@ -236,6 +293,38 @@ public class ExpertReviewService {
         return actor;
     }
 
+    private void requireResponsibleReviewer(
+            ExpertReviewRepository.ReviewTaskData review,
+            Responsibility responsibility,
+            AuthenticatedUser actor) {
+        if (actor.userId().equals(review.submittedBy())) {
+            throw BusinessException.forbidden(
+                    "课题负责人不能兼任医学或统计审核");
+        }
+        UUID assigned = responsibility == Responsibility.MEDICAL_REVIEW
+                ? review.expertReviewerId()
+                : review.statisticalReviewerId();
+        UUID other = responsibility == Responsibility.MEDICAL_REVIEW
+                ? review.statisticalReviewerId()
+                : review.expertReviewerId();
+        if (assigned != null && !assigned.equals(actor.userId())) {
+            throw BusinessException.notFound("专家审核任务不存在");
+        }
+        if (actor.userId().equals(other)) {
+            throw BusinessException.forbidden(
+                    "医学审核和统计审核必须由不同账号完成");
+        }
+        boolean commentedForOtherResponsibility = reviews
+                .findComments(actor.hospitalId(), review.id()).stream()
+                .anyMatch(comment -> comment.reviewRoundNo() == review.roundNo()
+                        && actor.userId().equals(comment.createdBy())
+                        && !responsibility.name().equals(comment.responsibility()));
+        if (commentedForOtherResponsibility) {
+            throw BusinessException.forbidden(
+                    "同一审核轮次的医学审核和统计审核必须由不同账号完成");
+        }
+    }
+
     private AuthenticatedUser requireReadyUser() {
         AuthenticatedUser actor = currentUser.requireUser();
         if (actor.forcePasswordChange()) {
@@ -255,21 +344,29 @@ public class ExpertReviewService {
                                 value.protocolSectionVersionNo(),
                                 value.strobeItemResultId(),
                                 CommentType.valueOf(value.commentType()),
+                                value.responsibility(),
+                                value.reviewRoundNo(),
                                 value.content(), value.createdBy(), value.createdAt()))
                         .toList();
         List<ReviewAction> history =
                 reviews.findActions(task.hospitalId(), task.id()).stream()
                         .map(value -> new ReviewAction(
-                                value.id(), value.actionType(), value.actorUserId(),
+                                value.id(), value.actionType(),
+                                value.reviewRoundNo(), value.actorUserId(),
                                 value.summary(), value.occurredAt()))
                         .toList();
         return new ReviewView(
                 task.id(), task.projectId(), task.agentTaskId(), task.protocolId(),
-                task.strobeCheckTaskId(), task.status(), task.submittedBy(),
+                task.strobeCheckTaskId(), task.status(), task.roundNo(),
+                task.submittedBy(),
                 task.submittedAt(), task.expertReviewerId(),
                 task.expertDecision() == null ? null
                         : Decision.valueOf(task.expertDecision()),
                 task.expertSummary(), task.expertDecidedAt(),
+                task.statisticalReviewerId(),
+                task.statisticalDecision() == null ? null
+                        : Decision.valueOf(task.statisticalDecision()),
+                task.statisticalSummary(), task.statisticalDecidedAt(),
                 task.ownerConfirmedBy(), task.ownerConfirmedAt(),
                 task.sectionsLocked(), task.version(), comments, history);
     }
@@ -279,7 +376,23 @@ public class ExpertReviewService {
         var event = workflows.appendEvent(
                 task.hospitalId(), task.id(), eventType,
                 "STEP_17_WAIT_EXPERT_REVIEW", payloadJson, clock.instant());
-        events.publish(event);
+        publishAfterCommit(event);
+    }
+
+    private void publishAfterCommit(
+            AgentWorkflowRepository.EventData event) {
+        if (TransactionSynchronizationManager
+                .isActualTransactionActive()) {
+            TransactionSynchronizationManager.registerSynchronization(
+                    new TransactionSynchronization() {
+                        @Override
+                        public void afterCommit() {
+                            events.publish(event);
+                        }
+                    });
+        } else {
+            events.publish(event);
+        }
     }
 
     private JsonNode readTree(String value) {

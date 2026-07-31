@@ -23,7 +23,16 @@ public class BusinessException extends RuntimeException {
         return new BusinessException("NOT_FOUND", message, HttpStatus.NOT_FOUND);
     }
 
+    public static BusinessException projectNotFound() {
+        return new BusinessException(
+                "PROJECT_NOT_FOUND", "课题不存在", HttpStatus.NOT_FOUND);
+    }
+
     public static BusinessException conflict(String message) {
         return new BusinessException("CONFLICT", message, HttpStatus.CONFLICT);
+    }
+
+    public static BusinessException conflict(String code, String message) {
+        return new BusinessException(code, message, HttpStatus.CONFLICT);
     }
 }

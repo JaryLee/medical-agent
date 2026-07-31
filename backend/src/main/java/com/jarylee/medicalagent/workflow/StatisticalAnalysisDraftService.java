@@ -102,12 +102,10 @@ public class StatisticalAnalysisDraftService {
                 .filter(value -> "STATISTICAL_ANALYSIS".equals(value.sectionCode()))
                 .findFirst()
                 .orElseThrow(() -> new IllegalStateException("研究方案缺少统计分析章节"));
-        if (previous.versionNo() != 1) {
-            throw new IllegalStateException("统计分析章节已被修改，不能静默覆盖");
-        }
         var statisticalSection = new ResearchProtocolModels.ProtocolSection(
                 previous.sectionId(), previous.sectionCode(), previous.title(),
-                previous.sortOrder(), 2, sectionContent, "MARKDOWN",
+                previous.sortOrder(), previous.versionNo() + 1,
+                sectionContent, "MARKDOWN",
                 "AGENT_DETERMINISTIC", "NEEDS_EXPERT_REVIEW",
                 List.of("STEP12", "STEP13"),
                 List.of(

@@ -12,6 +12,11 @@ public final class ExpertReviewModels {
         RETURN_FOR_REVISION
     }
 
+    public enum Responsibility {
+        MEDICAL_REVIEW,
+        STATISTICAL_REVIEW
+    }
+
     public enum CommentType {
         MEDICAL,
         STATISTICAL,
@@ -25,6 +30,8 @@ public final class ExpertReviewModels {
             Integer protocolSectionVersionNo,
             UUID strobeItemResultId,
             CommentType commentType,
+            String responsibility,
+            int reviewRoundNo,
             String content,
             UUID createdBy,
             Instant createdAt
@@ -33,6 +40,7 @@ public final class ExpertReviewModels {
     public record ReviewAction(
             UUID id,
             String actionType,
+            int reviewRoundNo,
             UUID actorUserId,
             String summary,
             Instant occurredAt
@@ -45,12 +53,17 @@ public final class ExpertReviewModels {
             UUID protocolId,
             UUID strobeCheckTaskId,
             String status,
+            int reviewRoundNo,
             UUID submittedBy,
             Instant submittedAt,
             UUID expertReviewerId,
             Decision expertDecision,
             String expertSummary,
             Instant expertDecidedAt,
+            UUID statisticalReviewerId,
+            Decision statisticalDecision,
+            String statisticalSummary,
+            Instant statisticalDecidedAt,
             UUID ownerConfirmedBy,
             Instant ownerConfirmedAt,
             boolean sectionsLocked,

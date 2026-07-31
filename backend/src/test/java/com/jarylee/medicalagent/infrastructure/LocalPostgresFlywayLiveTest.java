@@ -42,7 +42,7 @@ class LocalPostgresFlywayLiveTest {
                          """);
                  var tables = statement.executeQuery()) {
                 assertThat(tables.next()).isTrue();
-                assertThat(tables.getInt(1)).isEqualTo(45);
+                assertThat(tables.getInt(1)).isEqualTo(59);
             }
             try (var connection = DriverManager.getConnection(databaseUrl, "medical_agent", "");
                  var statement = connection.prepareStatement("""
@@ -89,13 +89,107 @@ class LocalPostgresFlywayLiveTest {
                              'strobe_completeness_check_task',
                              'strobe_completeness_check_item',
                              'research_review_task','research_review_comment',
-                             'research_review_action','document_template_version',
+                             'research_review_action','research_review_decision',
+                             'document_template_version',
                              'document_export_record','citation_style_version'
                            )
                          """);
                  var tables = statement.executeQuery()) {
                 assertThat(tables.next()).isTrue();
-                assertThat(tables.getInt(1)).isEqualTo(29);
+                assertThat(tables.getInt(1)).isEqualTo(30);
+            }
+            try (var connection = DriverManager.getConnection(databaseUrl, "medical_agent", "");
+                 var statement = connection.prepareStatement("""
+                         select count(*) from information_schema.columns
+                         where table_schema='public' and table_name='ai_model_call_log'
+                           and column_name in (
+                             'input_sha256','output_sha256','input_snapshot_json',
+                             'output_snapshot_json','status','payload_retention_until',
+                             'metadata_retention_until','logical_model_type',
+                             'route_policy_version','provider_request_id','usage_source',
+                             'input_tokens','cached_input_tokens','output_tokens','total_tokens',
+                             'price_version','price_currency','reserved_cost_micros',
+                             'estimated_cost_micros','cost_status'
+                           )
+                         """);
+                 var columns = statement.executeQuery()) {
+                assertThat(columns.next()).isTrue();
+                assertThat(columns.getInt(1)).isEqualTo(20);
+            }
+            try (var connection = DriverManager.getConnection(databaseUrl, "medical_agent", "");
+                 var statement = connection.prepareStatement("""
+                         select count(*) from information_schema.columns
+                         where table_schema='public' and table_name='ai_agent_task'
+                           and column_name in (
+                             'execution_token','lease_owner','lease_acquired_at',
+                             'heartbeat_at','current_step_attempt_id'
+                           )
+                         """);
+                 var columns = statement.executeQuery()) {
+                assertThat(columns.next()).isTrue();
+                assertThat(columns.getInt(1)).isEqualTo(5);
+            }
+            try (var connection = DriverManager.getConnection(databaseUrl, "medical_agent", "");
+                 var statement = connection.prepareStatement("""
+                         select count(*) from information_schema.columns
+                         where table_schema='public'
+                           and (
+                             (table_name='ai_agent_step_run'
+                              and column_name='step_attempt_id')
+                             or
+                             (table_name='ai_agent_event'
+                              and column_name='event_key')
+                           )
+                         """);
+                 var columns = statement.executeQuery()) {
+                assertThat(columns.next()).isTrue();
+                assertThat(columns.getInt(1)).isEqualTo(2);
+            }
+            try (var connection = DriverManager.getConnection(databaseUrl, "medical_agent", "");
+                 var statement = connection.prepareStatement("""
+                         select count(*) from information_schema.columns
+                         where table_schema='public'
+                           and table_name='ai_agent_tool_call'
+                           and column_name in (
+                             'step_attempt_id','tool_call_key','operation_key',
+                             'request_sha256','result_json','status'
+                           )
+                         """);
+                 var columns = statement.executeQuery()) {
+                assertThat(columns.next()).isTrue();
+                assertThat(columns.getInt(1)).isEqualTo(6);
+            }
+            try (var connection = DriverManager.getConnection(databaseUrl, "medical_agent", "");
+                 var statement = connection.prepareStatement("""
+                         select count(*) from information_schema.tables
+                         where table_schema='public'
+                           and table_name in (
+                             'project_workspace_cursor',
+                             'project_read_model_event',
+                             'project_workspace_command'
+                           )
+                         """);
+                 var tables = statement.executeQuery()) {
+                assertThat(tables.next()).isTrue();
+                assertThat(tables.getInt(1)).isEqualTo(3);
+            }
+            try (var connection = DriverManager.getConnection(databaseUrl, "medical_agent", "");
+                 var statement = connection.prepareStatement("""
+                         select count(*) from information_schema.tables
+                         where table_schema='public'
+                           and table_name in (
+                             'project_model_budget',
+                             'protocol_section_model_candidate',
+                             'protocol_section_model_review',
+                             'observational_design_model_advice',
+                             'model_evaluation_run',
+                             'model_evaluation_case_result',
+                             'model_evaluation_expert_score'
+                           )
+                         """);
+                 var tables = statement.executeQuery()) {
+                assertThat(tables.next()).isTrue();
+                assertThat(tables.getInt(1)).isEqualTo(7);
             }
         } finally {
             try (var connection = DriverManager.getConnection(adminUrl, adminUser, "");

@@ -30,11 +30,14 @@ public class AuthenticationService {
 
     public LoginResult login(String hospitalCode, String username, String password) {
         Instant now = clock.instant();
-        UUID hospitalId = hospitalCode == null || hospitalCode.isBlank() ? null :
-                repository.findHospitalByCode(hospitalCode)
-                        .map(IdentityRepository.HospitalData::id)
-                        .orElseThrow(() -> new BadCredentialsException("用户名或密码错误"));
-        IdentityRepository.UserData user = repository.findUser(hospitalId, username)
+        UUID hospitalId = resolveHospitalId(hospitalCode);
+        String normalizedUsername;
+        try {
+            normalizedUsername = IdentityNormalizer.username(username);
+        } catch (IllegalArgumentException exception) {
+            throw new BadCredentialsException("用户名或密码错误");
+        }
+        IdentityRepository.UserData user = repository.findUser(hospitalId, normalizedUsername)
                 .orElseThrow(() -> {
                     auditService.recordSystem(hospitalId, "LOGIN_FAILED", "USER", username);
                     return new BadCredentialsException("用户名或密码错误");
@@ -99,6 +102,20 @@ public class AuthenticationService {
                 || !password.matches(".*[A-Z].*") || !password.matches(".*[a-z].*")
                 || !password.matches(".*\\d.*")) {
             throw new IllegalArgumentException("密码至少12位，且包含大小写字母和数字");
+        }
+    }
+
+    private UUID resolveHospitalId(String hospitalCode) {
+        if (hospitalCode == null || hospitalCode.isBlank()) {
+            return null;
+        }
+        try {
+            return repository.findHospitalByCode(
+                            IdentityNormalizer.hospitalCode(hospitalCode))
+                    .map(IdentityRepository.HospitalData::id)
+                    .orElseThrow(() -> new BadCredentialsException("用户名或密码错误"));
+        } catch (IllegalArgumentException exception) {
+            throw new BadCredentialsException("用户名或密码错误");
         }
     }
 

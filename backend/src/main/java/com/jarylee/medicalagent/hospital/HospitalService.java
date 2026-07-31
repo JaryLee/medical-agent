@@ -29,11 +29,12 @@ public class HospitalService {
 
     public HospitalView createHospital(String code, String name) {
         AuthenticatedUser actor = requireRole(Role.PLATFORM_ADMIN);
-        if (repository.findHospitalByCode(code.trim()).isPresent()) {
+        String normalizedCode = IdentityNormalizer.hospitalCode(code);
+        if (repository.findHospitalByCode(normalizedCode).isPresent()) {
             throw BusinessException.conflict("医院编码已存在");
         }
         var row = new IdentityRepository.HospitalData(
-                UUID.randomUUID(), code.trim(), name.trim(), Instant.now());
+                UUID.randomUUID(), normalizedCode, name.trim(), Instant.now());
         repository.insertHospital(row);
         audit.record(actor, "HOSPITAL_CREATED", "HOSPITAL", row.id().toString());
         return view(row);
@@ -57,11 +58,12 @@ public class HospitalService {
         }
         if (repository.findHospitalById(hospitalId).isEmpty()) throw BusinessException.notFound("医院不存在");
         if (roles.contains(Role.PLATFORM_ADMIN)) throw BusinessException.forbidden("医院用户不能授予平台管理员");
-        if (repository.findUser(hospitalId, username.trim()).isPresent()) {
+        String normalizedUsername = IdentityNormalizer.username(username);
+        if (repository.findUser(hospitalId, normalizedUsername).isPresent()) {
             throw BusinessException.conflict("本院用户名已存在");
         }
         authentication.validatePassword(initialPassword);
-        var user = new IdentityRepository.UserData(UUID.randomUUID(), hospitalId, username.trim(),
+        var user = new IdentityRepository.UserData(UUID.randomUUID(), hospitalId, normalizedUsername,
                 encoder.encode(initialPassword), Set.copyOf(roles), true, true, 0, null);
         repository.insertUser(user);
         audit.record(actor, "USER_CREATED", "USER", user.id().toString());
@@ -73,19 +75,21 @@ public class HospitalService {
         if (!actor.hasRole(Role.HOSPITAL_ADMIN) && !actor.hasRole(Role.PLATFORM_ADMIN)) {
             throw BusinessException.forbidden("无权查看用户");
         }
-        return repository.findUsers().stream()
-                .filter(row -> actor.hasRole(Role.PLATFORM_ADMIN)
-                        || Objects.equals(row.hospitalId(), actor.hospitalId()))
+        List<IdentityRepository.UserData> users = actor.hasRole(Role.PLATFORM_ADMIN)
+                ? repository.findUsers()
+                : repository.findUsers(actor.hospitalId());
+        return users.stream()
                 .map(this::view).toList();
     }
 
     public void disableUser(UUID userId) {
         AuthenticatedUser actor = currentUser.requireUser();
-        IdentityRepository.UserData target = repository.findUserById(userId)
+        IdentityRepository.UserData target = (actor.hasRole(Role.PLATFORM_ADMIN)
+                ? repository.findUserById(userId)
+                : repository.findUserById(actor.hospitalId(), userId))
                 .orElseThrow(() -> BusinessException.notFound("用户不存在"));
         if (!actor.hasRole(Role.PLATFORM_ADMIN)
-                && (!actor.hasRole(Role.HOSPITAL_ADMIN)
-                || !Objects.equals(actor.hospitalId(), target.hospitalId()))) {
+                && !actor.hasRole(Role.HOSPITAL_ADMIN)) {
             throw BusinessException.notFound("用户不存在");
         }
         target = new IdentityRepository.UserData(target.id(), target.hospitalId(), target.username(),

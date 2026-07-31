@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.jarylee.medicalagent.agent.PrototypeService;
 import com.jarylee.medicalagent.agent.model.ResearchModels.AnalysisResult;
 import com.jarylee.medicalagent.agent.model.ResearchModels.PecoDefinition;
+import com.jarylee.medicalagent.agent.model.LogicalModelType;
 import com.jarylee.medicalagent.agent.prompt.PromptTemplateRegistry;
 import com.jarylee.medicalagent.literature.SearchStrategyService;
 import com.jarylee.medicalagent.literature.ClinicalTrialsGovSearchGateway.ClinicalTrialsSearchException;
@@ -21,16 +22,24 @@ import com.jarylee.medicalagent.literature.SimilarResearchAnalysisService.Simila
 import com.jarylee.medicalagent.literature.SimilarResearchAnalysisModels;
 import com.jarylee.medicalagent.literature.SearchStrategyService.SearchStrategy;
 import com.jarylee.medicalagent.review.ExpertReviewService;
+import com.jarylee.medicalagent.review.ExpertReviewModels;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
+import jakarta.annotation.PreDestroy;
 
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 @Component
 public class AgentWorkflowWorker {
@@ -40,7 +49,10 @@ public class AgentWorkflowWorker {
     private final ObjectMapper json;
     private final Clock clock;
     private final Duration leaseDuration;
+    private final Duration heartbeatInterval;
     private final PromptTemplateRegistry prompts;
+    private final ModelCallAuditService modelCalls;
+    private final AgentToolCallService toolCalls;
     private final ObservationalStudyRuleService studyRules;
     private final SearchStrategyService searchStrategies;
     private final LiteratureSearchService literatureSearch;
@@ -53,11 +65,22 @@ public class AgentWorkflowWorker {
     private final ClaimCitationValidationService claimCitationValidation;
     private final StrobeCompletenessService strobeCompleteness;
     private final ExpertReviewService expertReview;
+    private final String workerId = "worker-" + UUID.randomUUID();
+    private final ScheduledExecutorService heartbeatExecutor =
+            Executors.newSingleThreadScheduledExecutor(runnable -> {
+                Thread thread = new Thread(runnable, "agent-lease-heartbeat");
+                thread.setDaemon(true);
+                return thread;
+            });
 
     public AgentWorkflowWorker(AgentWorkflowRepository repository, AgentWorkflowService service,
                                PrototypeService prototype, ObjectMapper json, Clock clock,
-                               @Value("${medical.agent.lease-duration:30s}") Duration leaseDuration,
+                               @Value("${medical.agent.lease-duration:45s}") Duration leaseDuration,
+                               @Value("${medical.agent.heartbeat-interval:10s}")
+                               Duration heartbeatInterval,
                                PromptTemplateRegistry prompts,
+                               ModelCallAuditService modelCalls,
+                               AgentToolCallService toolCalls,
                                ObservationalStudyRuleService studyRules,
                                SearchStrategyService searchStrategies,
                                LiteratureSearchService literatureSearch,
@@ -76,7 +99,15 @@ public class AgentWorkflowWorker {
         this.json = json;
         this.clock = clock;
         this.leaseDuration = leaseDuration;
+        if (heartbeatInterval.isZero() || heartbeatInterval.isNegative()
+                || heartbeatInterval.multipliedBy(3).compareTo(leaseDuration) >= 0) {
+            throw new IllegalArgumentException(
+                    "Agent心跳间隔必须大于0且严格小于租约时长的三分之一");
+        }
+        this.heartbeatInterval = heartbeatInterval;
         this.prompts = prompts;
+        this.modelCalls = modelCalls;
+        this.toolCalls = toolCalls;
         this.studyRules = studyRules;
         this.searchStrategies = searchStrategies;
         this.literatureSearch = literatureSearch;
@@ -97,163 +128,243 @@ public class AgentWorkflowWorker {
     public void poll() {
         Instant now = clock.instant();
         for (var task : repository.findTimedOut(now, 20)) {
-            repository.fail(task.hospitalId(), task.id(), "TASK_TIMEOUT", "Agent任务执行超时");
-            var failed = repository.findById(task.hospitalId(), task.id()).orElse(task);
-            service.publish(failed, "TASK_FAILED", failed.currentStep(),
-                    write(new FailurePayload("TASK_TIMEOUT", "Agent任务执行超时")));
+            var outcome = repository.failTimedOut(
+                    task.hospitalId(), task.id(), task.version(), now,
+                    new AgentWorkflowRepository.PendingEvent(
+                            "timeout:v" + task.version(), "TASK_FAILED",
+                            task.currentStep(),
+                            write(new FailurePayload(
+                                    "TASK_TIMEOUT", "Agent任务执行超时"))));
+            publishApplied(outcome);
         }
-        for (var task : repository.findRunnable(now, 5)) {
-            if (repository.claim(task.hospitalId(), task.id(), task.version(), now.plus(leaseDuration))) {
-                execute(task);
-            }
-        }
+        repository.claimNext(now, workerId, leaseDuration)
+                .ifPresent(claimed -> {
+                    service.publishCommitted(claimed.events());
+                    execute(claimed.task(), claimed.claim());
+                });
     }
 
-    void execute(AgentWorkflowRepository.TaskData claimedFrom) {
+    void execute(
+            AgentWorkflowRepository.TaskData claimedFrom,
+            AgentWorkflowRepository.ClaimHandle claim) {
         var task = repository.findById(claimedFrom.hospitalId(), claimedFrom.id())
                 .orElseThrow();
-        int attempt = Math.toIntExact(task.version());
-        service.publish(task, "TASK_STARTED", task.currentStep(),
-                write(new AgentWorkflowService.StatusPayload("RUNNING")));
+        int attempt = claim.attemptNo();
+        var heartbeat = heartbeatExecutor.scheduleAtFixedRate(
+                () -> {
+                    Instant heartbeatAt = clock.instant();
+                    repository.heartbeat(
+                            claim, heartbeatAt.plus(leaseDuration), heartbeatAt);
+                },
+                heartbeatInterval.toMillis(), heartbeatInterval.toMillis(),
+                TimeUnit.MILLISECONDS);
         try {
+            if (!renewClaim(claim)) return;
             AgentWorkflowService.TaskInput input =
                     json.readValue(task.inputJson(), AgentWorkflowService.TaskInput.class);
             if ("STEP_01_PARSE_IDEA".equals(task.currentStep())) {
-                executeAnalysis(task, input, attempt);
+                executeAnalysis(task, claim, input, attempt);
             } else if ("STEP_04_GENERATE_RESEARCH_DIRECTIONS".equals(task.currentStep())) {
-                executeDirections(task, input, attempt);
+                executeDirections(task, claim, input, attempt);
             } else if ("STEP_05_CONFIRM_DIRECTION".equals(task.currentStep())) {
-                executeConfirmation(task, input, attempt);
+                executeConfirmation(task, claim, input, attempt);
             } else if ("STEP_08_SEARCH_PUBMED".equals(task.currentStep())) {
-                executePubMedSearch(task, attempt);
+                executePubMedSearch(task, claim, attempt);
             } else if ("STEP_09_SEARCH_CLINICAL_TRIALS".equals(task.currentStep())) {
-                executeClinicalTrialsSearch(task, attempt);
+                executeClinicalTrialsSearch(task, claim, attempt);
             } else if ("STEP_10_VALIDATE_LITERATURE".equals(task.currentStep())) {
-                executeLiteratureValidation(task, attempt);
+                executeLiteratureValidation(task, claim, attempt);
             } else if ("STEP_11_ANALYZE_SIMILAR_RESEARCH".equals(task.currentStep())) {
-                executeSimilarResearchAnalysis(task, attempt);
+                executeSimilarResearchAnalysis(task, claim, attempt);
             } else if ("STEP_12_RECOMMEND_OBSERVATIONAL_DESIGN".equals(task.currentStep())) {
-                executeObservationalDesignRecommendation(task, input, attempt);
+                executeObservationalDesignRecommendation(task, claim, input, attempt);
             } else if ("STEP_13_GENERATE_PROTOCOL_SECTIONS".equals(task.currentStep())) {
-                executeProtocolSections(task, attempt);
+                executeProtocolSections(task, claim, attempt);
             } else if ("STEP_14_GENERATE_STATISTICAL_DRAFT".equals(task.currentStep())) {
-                executeStatisticalDraft(task, attempt);
+                executeStatisticalDraft(task, claim, attempt);
             } else if ("STEP_15_VALIDATE_CLAIMS_AND_CITATIONS".equals(task.currentStep())) {
-                executeClaimCitationValidation(task, attempt);
+                executeClaimCitationValidation(task, claim, attempt);
             } else if ("STEP_16_CHECK_STROBE_COMPLETENESS".equals(task.currentStep())) {
-                executeStrobeCompletenessCheck(task, attempt);
+                executeStrobeCompletenessCheck(task, claim, attempt);
             } else {
                 throw new IllegalStateException("不支持的Agent步骤: " + task.currentStep());
             }
         } catch (PubMedSearchException exception) {
-            repository.fail(task.hospitalId(), task.id(), exception.code(), exception.getMessage());
-            var failed = repository.findById(task.hospitalId(), task.id()).orElse(task);
-            service.publish(failed, "TASK_FAILED", failed.currentStep(),
-                    write(new FailurePayload(exception.code(), exception.getMessage())));
+            failClaim(claim, exception.code(), exception.getMessage(), exception.getMessage());
         } catch (ClinicalTrialsSearchException exception) {
-            repository.fail(task.hospitalId(), task.id(), exception.code(), exception.getMessage());
-            var failed = repository.findById(task.hospitalId(), task.id()).orElse(task);
-            service.publish(failed, "TASK_FAILED", failed.currentStep(),
-                    write(new FailurePayload(exception.code(), exception.getMessage())));
+            failClaim(claim, exception.code(), exception.getMessage(), exception.getMessage());
         } catch (CrossrefMetadataException exception) {
-            repository.fail(task.hospitalId(), task.id(), exception.code(), exception.getMessage());
-            var failed = repository.findById(task.hospitalId(), task.id()).orElse(task);
-            service.publish(failed, "TASK_FAILED", failed.currentStep(),
-                    write(new FailurePayload(exception.code(), exception.getMessage())));
+            failClaim(claim, exception.code(), exception.getMessage(), exception.getMessage());
         } catch (SimilarResearchAnalysisException exception) {
-            repository.fail(task.hospitalId(), task.id(), exception.code(), exception.getMessage());
-            var failed = repository.findById(task.hospitalId(), task.id()).orElse(task);
-            service.publish(failed, "TASK_FAILED", failed.currentStep(),
-                    write(new FailurePayload(exception.code(), exception.getMessage())));
+            failClaim(claim, exception.code(), exception.getMessage(), exception.getMessage());
         } catch (Exception exception) {
-            repository.fail(task.hospitalId(), task.id(), "AGENT_STEP_FAILED", exception.getMessage());
-            var failed = repository.findById(task.hospitalId(), task.id()).orElse(task);
-            service.publish(failed, "TASK_FAILED", failed.currentStep(),
-                    write(new FailurePayload("AGENT_STEP_FAILED", "Agent步骤执行失败")));
+            failClaim(
+                    claim, "AGENT_STEP_FAILED", exception.getMessage(),
+                    "Agent步骤执行失败");
+        } finally {
+            heartbeat.cancel(false);
         }
     }
 
+    @PreDestroy
+    void shutdownHeartbeatExecutor() {
+        heartbeatExecutor.shutdownNow();
+    }
+
     private void executeAnalysis(AgentWorkflowRepository.TaskData task,
+                                 AgentWorkflowRepository.ClaimHandle claim,
                                  AgentWorkflowService.TaskInput input, int attempt) {
         Instant started = clock.instant();
-        var analysis = prototype.analyze(input.idea());
+        var prompt = prompts.require("STEP_01_PARSE_IDEA");
+        var route = prototype.resolve(LogicalModelType.RESEARCH_FAST);
+        var invocation = modelCalls.invokeAnalysis(
+                task, attempt, prompt, route, input.idea(),
+                () -> prototype.invokeAnalysis(
+                        LogicalModelType.RESEARCH_FAST, input.idea(), prompt));
+        var analysis = invocation.output();
         if (cancelled(task)) return;
-        saveCompletedStep(task, "STEP_01_PARSE_IDEA", attempt, input,
-                analysis.profile(), started, "STEP_01_PARSE_IDEA", "[]");
-        saveCompletedStep(task, "STEP_02_IDENTIFY_MISSING_INFORMATION", attempt,
-                analysis.profile(), analysis.profile().missingInformation(), started, null, "[]");
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step01 = completedStep(task, "STEP_01_PARSE_IDEA", attempt, input,
+                analysis.profile(), started, "STEP_01_PARSE_IDEA", "[]",
+                invocation.modelCallId());
+        var step02 = completedStep(task, "STEP_02_IDENTIFY_MISSING_INFORMATION", attempt,
+                analysis.profile(), analysis.profile().missingInformation(), started, null, "[]",
+                null);
+        var step03 = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(), "STEP_03_ASK_CLARIFICATION",
                 attempt, "WAITING_CONFIRMATION", "missing-information/v1",
                 "clarification-answers/v1", write(analysis.clarificationQuestions()), null,
-                null, null, "[]", null, null, clock.instant(), null, true, null, null));
+                null, null, "[]", null, null, clock.instant(), null, true, null, null);
         var clarification = new AgentWorkflowService.ClarificationOutput(
                 analysis.profile(), analysis.clarificationQuestions(), analysis.disclaimer());
-        repository.waitForClarification(task.hospitalId(), task.id(), write(clarification));
-        var waiting = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(waiting, "WAITING_CLARIFICATION", "STEP_03_ASK_CLARIFICATION",
-                write(clarification));
+        commit(
+                claim, List.of(step01, step02, step03),
+                "STEP_03_ASK_CLARIFICATION", "WAITING_CONFIRMATION",
+                write(clarification), null,
+                List.of(
+                        event(claim, "step01", "STEP_COMPLETED",
+                                "STEP_01_PARSE_IDEA",
+                                new StepPayload("STEP_01_PARSE_IDEA", attempt)),
+                        event(claim, "step02", "STEP_COMPLETED",
+                                "STEP_02_IDENTIFY_MISSING_INFORMATION",
+                                new StepPayload(
+                                        "STEP_02_IDENTIFY_MISSING_INFORMATION", attempt)),
+                        event(claim, "waiting", "WAITING_CLARIFICATION",
+                                "STEP_03_ASK_CLARIFICATION", clarification)));
     }
 
     private void executeDirections(AgentWorkflowRepository.TaskData task,
+                                   AgentWorkflowRepository.ClaimHandle claim,
                                    AgentWorkflowService.TaskInput input, int attempt) {
         Instant started = clock.instant();
-        var analysis = prototype.analyze(contextualIdea(input));
+        String directionInput = contextualIdea(input);
+        var prompt = prompts.require("STEP_04_GENERATE_RESEARCH_DIRECTIONS");
+        var route = prototype.resolve(LogicalModelType.RESEARCH_FAST);
+        var invocation = modelCalls.invokeAnalysis(
+                task, attempt, prompt, route, directionInput,
+                () -> prototype.invokeAnalysis(
+                        LogicalModelType.RESEARCH_FAST, directionInput, prompt));
+        var analysis = invocation.output();
         if (cancelled(task)) return;
-        saveCompletedStep(task, "STEP_04_GENERATE_RESEARCH_DIRECTIONS", attempt,
+        UUID candidateSetId = UUID.randomUUID();
+        String candidatesJson = write(analysis.directions());
+        String candidateSetHash = sha256(candidatesJson);
+        var step04 = completedStep(task, "STEP_04_GENERATE_RESEARCH_DIRECTIONS", attempt,
                 input, analysis.directions(), started,
-                "STEP_04_GENERATE_RESEARCH_DIRECTIONS", "[]");
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+                "STEP_04_GENERATE_RESEARCH_DIRECTIONS", "[]",
+                invocation.modelCallId());
+        var step05 = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(), "STEP_05_CONFIRM_DIRECTION",
                 attempt, "WAITING_CONFIRMATION", "direction-candidates/v1",
-                "direction-confirmation/v1", write(analysis.directions()), null,
-                null, null, "[]", null, null, clock.instant(), null, true, null, null));
-        repository.waitForConfirmation(task.hospitalId(), task.id(), write(analysis));
-        var waiting = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(waiting, "WAITING_CONFIRMATION", "STEP_05_CONFIRM_DIRECTION",
-                write(analysis));
+                "direction-confirmation/v2",
+                write(new AgentWorkflowService.DirectionCandidateSetPayload(
+                        candidateSetId, candidateSetHash, analysis.directions())),
+                null,
+                null, null, "[]", null, null, clock.instant(), null, true, null, null);
+        ObjectNode waitingOutput = json.valueToTree(analysis);
+        waitingOutput.put("candidateSetId", candidateSetId.toString());
+        waitingOutput.put("candidateSetHash", candidateSetHash);
+        waitingOutput.put("candidateSetSchemaVersion", "direction-candidates/v1");
+        commit(
+                claim, List.of(step04, step05),
+                "STEP_05_CONFIRM_DIRECTION", "WAITING_CONFIRMATION",
+                write(waitingOutput), null,
+                List.of(
+                        event(claim, "step04", "STEP_COMPLETED",
+                                "STEP_04_GENERATE_RESEARCH_DIRECTIONS",
+                                new StepPayload(
+                                        "STEP_04_GENERATE_RESEARCH_DIRECTIONS", attempt)),
+                        event(claim, "waiting", "WAITING_CONFIRMATION",
+                                "STEP_05_CONFIRM_DIRECTION", waitingOutput)));
     }
 
     private void executeConfirmation(AgentWorkflowRepository.TaskData task,
+                                     AgentWorkflowRepository.ClaimHandle claim,
                                      AgentWorkflowService.TaskInput input, int attempt) {
         if (input.directionId() == null || input.directionId().isBlank()) {
             throw new IllegalArgumentException("缺少已确认研究方向");
         }
+        if (input.directionCandidateSetId() == null
+                || input.directionCandidateSetHash() == null
+                || input.directionCandidateSetHash().isBlank()) {
+            throw new IllegalArgumentException("缺少已确认研究方向候选集");
+        }
         Instant started = clock.instant();
-        var result = prototype.buildResearchQuestion(contextualIdea(input), input.directionId());
+        ObjectNode confirmedOutput = readOutput(task.outputJson());
+        if (!input.directionCandidateSetId().toString()
+                .equals(confirmedOutput.path("candidateSetId").asText())
+                || !input.directionCandidateSetHash()
+                .equals(confirmedOutput.path("candidateSetHash").asText())) {
+            throw new IllegalStateException("研究方向候选集版本或哈希不一致");
+        }
+        ObjectNode analysisSnapshot = confirmedOutput.deepCopy();
+        analysisSnapshot.remove(List.of(
+                "candidateSetId", "candidateSetHash", "candidateSetSchemaVersion"));
+        var confirmedAnalysis = treeToValue(analysisSnapshot, AnalysisResult.class);
+        var result = prototype.buildResearchQuestion(confirmedAnalysis, input.directionId());
         if (cancelled(task)) return;
-        saveCompletedStep(task, "STEP_06_BUILD_RESEARCH_QUESTION", attempt,
-                new AgentWorkflowService.DirectionPayload(input.directionId()), result.peco(), started,
-                "STEP_06_BUILD_RESEARCH_QUESTION", "[]");
+        var step06 = completedStep(task, "STEP_06_BUILD_RESEARCH_QUESTION", attempt,
+                new AgentWorkflowService.DirectionPayload(
+                        input.directionId(), input.directionCandidateSetId(),
+                        input.directionCandidateSetHash()),
+                result.peco(), started, null, "[]", null);
         var assessment = studyRules.assess(
                 result.selectedDirection().recommendedStudyType(), result.analysis(), answers(input));
         ObjectNode output = json.valueToTree(result);
         output.set("designAssessment", json.valueToTree(assessment));
         var strategy = searchStrategies.generate(result.peco());
         output.set("searchStrategy", json.valueToTree(strategy));
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step07 = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_07_BUILD_SEARCH_STRATEGY", attempt, "WAITING_CONFIRMATION",
                 "peco/v1", SearchStrategyService.SCHEMA_VERSION,
                 write(result.peco()), write(strategy), null, null, "[]",
-                null, null, clock.instant(), null, true, null, null));
-        repository.waitForSearchStrategyConfirmation(
-                task.hospitalId(), task.id(), write(output));
-        var waiting = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(waiting, "WAITING_SEARCH_STRATEGY",
-                "STEP_07_BUILD_SEARCH_STRATEGY",
-                write(output));
+                null, null, clock.instant(), null, true, null, null);
+        commit(
+                claim, List.of(step06, step07),
+                "STEP_07_BUILD_SEARCH_STRATEGY", "WAITING_CONFIRMATION",
+                write(output), null,
+                List.of(
+                        event(claim, "step06", "STEP_COMPLETED",
+                                "STEP_06_BUILD_RESEARCH_QUESTION",
+                                new StepPayload(
+                                        "STEP_06_BUILD_RESEARCH_QUESTION", attempt)),
+                        event(claim, "waiting", "WAITING_SEARCH_STRATEGY",
+                                "STEP_07_BUILD_SEARCH_STRATEGY", output)));
     }
 
     private void executePubMedSearch(
-            AgentWorkflowRepository.TaskData task, int attempt) {
+            AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim, int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
         SearchStrategy strategy = treeToValue(output.get("searchStrategy"), SearchStrategy.class);
-        var result = literatureSearch.execute(
-                task.hospitalId(), task.projectId(), task.id(), strategy);
+        var result = toolCalls.invoke(
+                claim, "NCBI_EUTILS_SEARCH", strategy,
+                PubMedSearchModels.SearchResult.class,
+                () -> literatureSearch.execute(
+                        task.hospitalId(), task.projectId(), task.id(), strategy));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_08_SEARCH_PUBMED", attempt, "COMPLETED",
                 SearchStrategyService.SCHEMA_VERSION,
@@ -263,24 +374,30 @@ public class AgentWorkflowWorker {
                         "tool", "NCBI_EUTILS",
                         "version", result.toolVersion(),
                         "requestCount", result.externalRequestCount()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("pubmedSearch", json.valueToTree(result));
-        repository.queueClinicalTrialsSearch(
-                task.hospitalId(), task.id(), write(output));
-        var queued = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(queued, "LITERATURE_SEARCH_COMPLETED",
-                "STEP_08_SEARCH_PUBMED", write(result));
+        commit(
+                claim, List.of(step),
+                "STEP_09_SEARCH_CLINICAL_TRIALS", "QUEUED",
+                write(output), null,
+                List.of(event(
+                        claim, "completed", "LITERATURE_SEARCH_COMPLETED",
+                        "STEP_08_SEARCH_PUBMED", result)));
     }
 
     private void executeClinicalTrialsSearch(
-            AgentWorkflowRepository.TaskData task, int attempt) {
+            AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim, int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
         SearchStrategy strategy = treeToValue(output.get("searchStrategy"), SearchStrategy.class);
-        var result = clinicalTrialsSearch.execute(
-                task.hospitalId(), task.projectId(), task.id(), strategy);
+        var result = toolCalls.invoke(
+                claim, "CLINICAL_TRIALS_GOV_SEARCH", strategy,
+                ClinicalTrialsSearchModels.SearchResult.class,
+                () -> clinicalTrialsSearch.execute(
+                        task.hospitalId(), task.projectId(), task.id(), strategy));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_09_SEARCH_CLINICAL_TRIALS", attempt, "COMPLETED",
                 SearchStrategyService.SCHEMA_VERSION,
@@ -291,17 +408,20 @@ public class AgentWorkflowWorker {
                         "version", result.toolVersion(),
                         "requestCount", result.externalRequestCount(),
                         "cacheHit", result.cacheHit()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("clinicalTrialsSearch", json.valueToTree(result));
-        repository.queueLiteratureValidation(
-                task.hospitalId(), task.id(), write(output));
-        var queued = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(queued, "CLINICAL_TRIALS_SEARCH_COMPLETED",
-                "STEP_09_SEARCH_CLINICAL_TRIALS", write(result));
+        commit(
+                claim, List.of(step),
+                "STEP_10_VALIDATE_LITERATURE", "QUEUED",
+                write(output), null,
+                List.of(event(
+                        claim, "completed", "CLINICAL_TRIALS_SEARCH_COMPLETED",
+                        "STEP_09_SEARCH_CLINICAL_TRIALS", result)));
     }
 
     private void executeLiteratureValidation(
-            AgentWorkflowRepository.TaskData task, int attempt) {
+            AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim, int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
         var pubmed = treeToValue(
@@ -309,10 +429,17 @@ public class AgentWorkflowWorker {
         var clinicalTrials = treeToValue(
                 output.get("clinicalTrialsSearch"),
                 ClinicalTrialsSearchModels.SearchResult.class);
-        var result = literatureValidation.execute(
-                task.hospitalId(), task.projectId(), task.id(), pubmed, clinicalTrials);
+        var validationRequest = Map.of(
+                "pubmedSearch", pubmed,
+                "clinicalTrialsSearch", clinicalTrials);
+        var result = toolCalls.invoke(
+                claim, "CROSSREF_METADATA_VALIDATION", validationRequest,
+                LiteratureValidationModels.ValidationResult.class,
+                () -> literatureValidation.execute(
+                        task.hospitalId(), task.projectId(), task.id(),
+                        pubmed, clinicalTrials));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_10_VALIDATE_LITERATURE", attempt, "COMPLETED",
                 LiteratureSearchService.RESULT_SCHEMA_VERSION,
@@ -325,17 +452,20 @@ public class AgentWorkflowWorker {
                         "version", result.toolVersion(),
                         "requestCount", result.externalRequestCount(),
                         "cacheHitCount", result.cacheHitCount()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("literatureValidation", json.valueToTree(result));
-        repository.queueSimilarResearchAnalysis(
-                task.hospitalId(), task.id(), write(output));
-        var queued = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(queued, "LITERATURE_VALIDATION_COMPLETED",
-                "STEP_10_VALIDATE_LITERATURE", write(result));
+        commit(
+                claim, List.of(step),
+                "STEP_11_ANALYZE_SIMILAR_RESEARCH", "QUEUED",
+                write(output), null,
+                List.of(event(
+                        claim, "completed", "LITERATURE_VALIDATION_COMPLETED",
+                        "STEP_10_VALIDATE_LITERATURE", result)));
     }
 
     private void executeSimilarResearchAnalysis(
-            AgentWorkflowRepository.TaskData task, int attempt) {
+            AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim, int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
         var peco = treeToValue(output.get("peco"), PecoDefinition.class);
@@ -349,11 +479,20 @@ public class AgentWorkflowWorker {
         var validation = treeToValue(
                 output.get("literatureValidation"),
                 LiteratureValidationModels.ValidationResult.class);
-        var result = similarResearchAnalysis.execute(
-                task.hospitalId(), task.projectId(), task.id(), peco, strategy,
-                pubmed, clinicalTrials, validation);
+        var analysisRequest = Map.of(
+                "peco", peco,
+                "searchStrategy", strategy,
+                "pubmedSearch", pubmed,
+                "clinicalTrialsSearch", clinicalTrials,
+                "literatureValidation", validation);
+        var result = toolCalls.invoke(
+                claim, "DETERMINISTIC_PECO_OVERLAP", analysisRequest,
+                SimilarResearchAnalysisModels.AnalysisResult.class,
+                () -> similarResearchAnalysis.execute(
+                        task.hospitalId(), task.projectId(), task.id(), peco, strategy,
+                        pubmed, clinicalTrials, validation));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_11_ANALYZE_SIMILAR_RESEARCH", attempt, "COMPLETED",
                 "similar-research-analysis-input/v1",
@@ -369,17 +508,20 @@ public class AgentWorkflowWorker {
                         "tool", "DETERMINISTIC_PECO_OVERLAP",
                         "version", result.algorithmVersion(),
                         "sourceCount", result.analyzedSourceCount()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("similarResearchAnalysis", json.valueToTree(result));
-        repository.queueObservationalDesignRecommendation(
-                task.hospitalId(), task.id(), write(output));
-        var queued = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(queued, "SIMILAR_RESEARCH_ANALYSIS_COMPLETED",
-                "STEP_11_ANALYZE_SIMILAR_RESEARCH", write(result));
+        commit(
+                claim, List.of(step),
+                "STEP_12_RECOMMEND_OBSERVATIONAL_DESIGN", "QUEUED",
+                write(output), null,
+                List.of(event(
+                        claim, "completed", "SIMILAR_RESEARCH_ANALYSIS_COMPLETED",
+                        "STEP_11_ANALYZE_SIMILAR_RESEARCH", result)));
     }
 
     private void executeObservationalDesignRecommendation(
             AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim,
             AgentWorkflowService.TaskInput input,
             int attempt) {
         Instant started = clock.instant();
@@ -389,11 +531,19 @@ public class AgentWorkflowWorker {
         var similar = treeToValue(
                 output.get("similarResearchAnalysis"),
                 SimilarResearchAnalysisModels.AnalysisResult.class);
-        var result = observationalDesign.execute(
-                task.hospitalId(), task.projectId(), task.id(),
-                analysis, peco, answers(input), similar);
+        var designRequest = Map.of(
+                "analysis", analysis,
+                "peco", peco,
+                "clarificationAnswers", answers(input),
+                "similarResearchAnalysis", similar);
+        var result = toolCalls.invoke(
+                claim, "OBSERVATIONAL_STUDY_RULES", designRequest,
+                ObservationalDesignRecommendationModels.Recommendation.class,
+                () -> observationalDesign.execute(
+                        task.hospitalId(), task.projectId(), task.id(),
+                        analysis, peco, answers(input), similar));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_12_RECOMMEND_OBSERVATIONAL_DESIGN", attempt,
                 "WAITING_CONFIRMATION",
@@ -409,20 +559,21 @@ public class AgentWorkflowWorker {
                         "tool", "OBSERVATIONAL_STUDY_RULES",
                         "version", result.algorithmVersion(),
                         "alternativeCount", result.alternatives().size()))),
-                null, null, started, null, true, null, null));
+                null, null, started, null, true, null, null);
         output.set("observationalDesignRecommendation", json.valueToTree(result));
-        repository.waitForObservationalDesignConfirmation(
-                task.hospitalId(), task.id(), write(output));
-        var waiting = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(
-                waiting,
-                "WAITING_OBSERVATIONAL_DESIGN_CONFIRMATION",
+        commit(
+                claim, List.of(step),
                 "STEP_12_RECOMMEND_OBSERVATIONAL_DESIGN",
-                write(result));
+                "WAITING_CONFIRMATION", write(output), null,
+                List.of(event(
+                        claim, "waiting",
+                        "WAITING_OBSERVATIONAL_DESIGN_CONFIRMATION",
+                        "STEP_12_RECOMMEND_OBSERVATIONAL_DESIGN", result)));
     }
 
     private void executeProtocolSections(
             AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim,
             int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
@@ -434,11 +585,19 @@ public class AgentWorkflowWorker {
         var similar = treeToValue(
                 output.get("similarResearchAnalysis"),
                 SimilarResearchAnalysisModels.AnalysisResult.class);
-        var result = protocolGeneration.execute(
-                task.hospitalId(), task.projectId(), task.id(),
-                analysis, peco, design, similar);
+        var protocolRequest = Map.of(
+                "analysis", analysis,
+                "peco", peco,
+                "confirmedObservationalDesign", design,
+                "similarResearchAnalysis", similar);
+        var result = toolCalls.invoke(
+                claim, "DETERMINISTIC_OBSERVATIONAL_PROTOCOL", protocolRequest,
+                ResearchProtocolModels.ProtocolDraft.class,
+                () -> protocolGeneration.execute(
+                        task.hospitalId(), task.projectId(), task.id(),
+                        analysis, peco, design, similar));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_13_GENERATE_PROTOCOL_SECTIONS", attempt, "COMPLETED",
                 "research-protocol-generation-input/v1",
@@ -453,20 +612,20 @@ public class AgentWorkflowWorker {
                         "tool", "DETERMINISTIC_OBSERVATIONAL_PROTOCOL",
                         "version", result.generatorVersion(),
                         "sectionCount", result.sections().size()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("protocolDraft", json.valueToTree(result));
-        repository.queueStatisticalDraft(
-                task.hospitalId(), task.id(), write(output));
-        var queued = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(
-                queued,
-                "PROTOCOL_SECTIONS_GENERATED",
-                "STEP_13_GENERATE_PROTOCOL_SECTIONS",
-                write(result));
+        commit(
+                claim, List.of(step),
+                "STEP_14_GENERATE_STATISTICAL_DRAFT", "QUEUED",
+                write(output), null,
+                List.of(event(
+                        claim, "completed", "PROTOCOL_SECTIONS_GENERATED",
+                        "STEP_13_GENERATE_PROTOCOL_SECTIONS", result)));
     }
 
     private void executeStatisticalDraft(
             AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim,
             int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
@@ -476,10 +635,17 @@ public class AgentWorkflowWorker {
         var design = treeToValue(
                 output.get("observationalDesignRecommendation"),
                 ObservationalDesignRecommendationModels.Recommendation.class);
-        var result = statisticalAnalysis.execute(
-                task.hospitalId(), task.projectId(), task.id(), protocol, design);
+        var statisticsRequest = Map.of(
+                "protocolDraft", protocol,
+                "confirmedObservationalDesign", design);
+        var result = toolCalls.invoke(
+                claim, "DETERMINISTIC_OBSERVATIONAL_STATISTICS",
+                statisticsRequest, StatisticalAnalysisModels.StatisticalDraft.class,
+                () -> statisticalAnalysis.execute(
+                        task.hospitalId(), task.projectId(), task.id(),
+                        protocol, design));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_14_GENERATE_STATISTICAL_DRAFT", attempt, "COMPLETED",
                 "statistical-analysis-input/v1",
@@ -493,23 +659,23 @@ public class AgentWorkflowWorker {
                         "version", result.generatorVersion(),
                         "sampleSizeParameterCount",
                         result.sampleSizeParameters().size()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("statisticalAnalysisDraft", json.valueToTree(result));
         output.set(
                 "protocolDraft",
                 json.valueToTree(statisticalAnalysis.applyToProtocol(protocol, result)));
-        repository.queueClaimCitationValidation(
-                task.hospitalId(), task.id(), write(output));
-        var queued = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(
-                queued,
-                "STATISTICAL_DRAFT_GENERATED",
-                "STEP_14_GENERATE_STATISTICAL_DRAFT",
-                write(result));
+        commit(
+                claim, List.of(step),
+                "STEP_15_VALIDATE_CLAIMS_AND_CITATIONS", "QUEUED",
+                write(output), null,
+                List.of(event(
+                        claim, "completed", "STATISTICAL_DRAFT_GENERATED",
+                        "STEP_14_GENERATE_STATISTICAL_DRAFT", result)));
     }
 
     private void executeClaimCitationValidation(
             AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim,
             int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
@@ -522,11 +688,19 @@ public class AgentWorkflowWorker {
         var validation = treeToValue(
                 output.get("literatureValidation"),
                 LiteratureValidationModels.ValidationResult.class);
-        var result = claimCitationValidation.execute(
-                task.hospitalId(), task.projectId(), task.id(),
-                protocol, pubmed, validation);
+        var citationRequest = Map.of(
+                "protocolDraft", protocol,
+                "pubmedSearch", pubmed,
+                "literatureValidation", validation);
+        var result = toolCalls.invoke(
+                claim, "DETERMINISTIC_CLAIM_CITATION_LINKER",
+                citationRequest,
+                ClaimCitationValidationModels.ValidationResult.class,
+                () -> claimCitationValidation.execute(
+                        task.hospitalId(), task.projectId(), task.id(),
+                        protocol, pubmed, validation));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_15_VALIDATE_CLAIMS_AND_CITATIONS", attempt, "COMPLETED",
                 "claim-citation-validation-input/v1",
@@ -541,20 +715,20 @@ public class AgentWorkflowWorker {
                         "version", result.validatorVersion(),
                         "claimCount", result.claimCount(),
                         "citationLinkCount", result.citationLinkCount()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("claimCitationValidation", json.valueToTree(result));
-        repository.queueStrobeCompletenessCheck(
-                task.hospitalId(), task.id(), write(output));
-        var queued = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(
-                queued,
-                "CLAIMS_AND_CITATIONS_VALIDATED",
-                "STEP_15_VALIDATE_CLAIMS_AND_CITATIONS",
-                write(result));
+        commit(
+                claim, List.of(step),
+                "STEP_16_CHECK_STROBE_COMPLETENESS", "QUEUED",
+                write(output), null,
+                List.of(event(
+                        claim, "completed", "CLAIMS_AND_CITATIONS_VALIDATED",
+                        "STEP_15_VALIDATE_CLAIMS_AND_CITATIONS", result)));
     }
 
     private void executeStrobeCompletenessCheck(
             AgentWorkflowRepository.TaskData task,
+            AgentWorkflowRepository.ClaimHandle claim,
             int attempt) {
         Instant started = clock.instant();
         ObjectNode output = readOutput(task.outputJson());
@@ -567,11 +741,18 @@ public class AgentWorkflowWorker {
         var claimValidation = treeToValue(
                 output.get("claimCitationValidation"),
                 ClaimCitationValidationModels.ValidationResult.class);
-        var result = strobeCompleteness.execute(
-                task.hospitalId(), task.projectId(), task.id(),
-                protocol, statisticalDraft, claimValidation);
+        var strobeRequest = Map.of(
+                "protocolDraft", protocol,
+                "statisticalAnalysisDraft", statisticalDraft,
+                "claimCitationValidation", claimValidation);
+        var result = toolCalls.invoke(
+                claim, "DETERMINISTIC_STROBE_2007_PRECHECK",
+                strobeRequest, StrobeCompletenessModels.CheckResult.class,
+                () -> strobeCompleteness.execute(
+                        task.hospitalId(), task.projectId(), task.id(),
+                        protocol, statisticalDraft, claimValidation));
         if (cancelled(task)) return;
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step16 = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_16_CHECK_STROBE_COMPLETENESS", attempt, "COMPLETED",
                 "strobe-completeness-check-input/v1",
@@ -585,12 +766,19 @@ public class AgentWorkflowWorker {
                         "tool", "DETERMINISTIC_STROBE_2007_PRECHECK",
                         "version", result.checkerVersion(),
                         "itemCount", result.totalItemCount()))),
-                null, null, started, clock.instant(), false, null, null));
+                null, null, started, clock.instant(), false, null, null);
         output.set("strobeCompletenessCheck", json.valueToTree(result));
-        var review = expertReview.open(
-                task, protocol.protocolId(), result.checkTaskId());
+        var review = toolCalls.invoke(
+                claim, "OPEN_EXPERT_REVIEW",
+                Map.of(
+                        "protocolId", protocol.protocolId(),
+                        "strobeCheckTaskId", result.checkTaskId()),
+                ExpertReviewModels.ReviewView.class,
+                () -> expertReview.open(
+                        task, protocol.protocolId(), result.checkTaskId(),
+                        write(output)));
         output.set("expertReview", json.valueToTree(review));
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        var step17 = new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(),
                 "STEP_17_WAIT_EXPERT_REVIEW", attempt, "WAITING_CONFIRMATION",
                 "expert-review-input/v1",
@@ -600,42 +788,84 @@ public class AgentWorkflowWorker {
                         "strobeCheckTaskId", result.checkTaskId())),
                 write(review), null, null,
                 write(List.of()), null, null, clock.instant(), null,
-                true, null, null));
-        repository.waitForExpertReview(
-                task.hospitalId(), task.id(), write(output));
-        var waiting = repository.findById(task.hospitalId(), task.id()).orElse(task);
-        service.publish(
-                waiting,
-                "STROBE_COMPLETENESS_CHECKED",
-                "STEP_16_CHECK_STROBE_COMPLETENESS",
-                write(result));
-        service.publish(
-                waiting,
-                "EXPERT_REVIEW_REQUIRED",
-                "STEP_17_WAIT_EXPERT_REVIEW",
-                write(review));
+                true, null, null);
+        commit(
+                claim, List.of(step16, step17),
+                "STEP_17_WAIT_EXPERT_REVIEW", "WAITING_CONFIRMATION",
+                write(output), null,
+                List.of(
+                        event(
+                                claim, "strobe", "STROBE_COMPLETENESS_CHECKED",
+                                "STEP_16_CHECK_STROBE_COMPLETENESS", result),
+                        event(
+                                claim, "review", "EXPERT_REVIEW_REQUIRED",
+                                "STEP_17_WAIT_EXPERT_REVIEW", review)));
     }
 
-    private void saveCompletedStep(AgentWorkflowRepository.TaskData task, String stepCode,
-                                   int attempt, Object input, Object output, Instant started,
-                                   String promptStep, String toolCallsJson) {
+    private AgentWorkflowRepository.StepData completedStep(
+            AgentWorkflowRepository.TaskData task, String stepCode,
+            int attempt, Object input, Object output, Instant started,
+            String promptStep, String toolCallsJson, UUID modelCallId) {
         Instant completed = clock.instant();
         String promptVersion = promptStep == null ? null : prompts.require(promptStep).version();
-        repository.saveStep(new AgentWorkflowRepository.StepData(
+        return new AgentWorkflowRepository.StepData(
                 UUID.randomUUID(), task.hospitalId(), task.id(), stepCode, attempt,
                 "COMPLETED", "research-workflow/v1", "research-workflow/v1",
-                write(input), write(output), promptStep == null ? null : UUID.randomUUID(),
+                write(input), write(output), modelCallId,
                 promptVersion, toolCallsJson,
                 null, null, started, completed,
-                false, null, null));
-        service.publish(task, "STEP_COMPLETED", stepCode,
-                write(new StepPayload(stepCode, attempt)));
+                false, null, null);
+    }
+
+    private AgentWorkflowRepository.PendingEvent event(
+            AgentWorkflowRepository.ClaimHandle claim, String suffix,
+            String eventType, String stepCode, Object payload) {
+        return new AgentWorkflowRepository.PendingEvent(
+                claim.stepAttemptId() + ":" + suffix,
+                eventType, stepCode, write(payload));
+    }
+
+    private void commit(
+            AgentWorkflowRepository.ClaimHandle claim,
+            List<AgentWorkflowRepository.StepData> steps,
+            String nextStep, String nextStatus, String outputJson,
+            Instant completedAt,
+            List<AgentWorkflowRepository.PendingEvent> events) {
+        var outcome = repository.commitClaim(
+                claim, steps,
+                new AgentWorkflowRepository.TaskTransition(
+                        nextStep, nextStatus, outputJson, completedAt),
+                events, clock.instant());
+        publishApplied(outcome);
+    }
+
+    private void failClaim(
+            AgentWorkflowRepository.ClaimHandle claim,
+            String errorCode, String persistedMessage, String publicMessage) {
+        var outcome = repository.failClaim(
+                claim, errorCode, persistedMessage,
+                event(claim, "failed", "TASK_FAILED", claim.stepCode(),
+                        new FailurePayload(errorCode, publicMessage)),
+                clock.instant());
+        publishApplied(outcome);
+    }
+
+    private void publishApplied(AgentWorkflowRepository.CommitOutcome outcome) {
+        if (outcome.status() == AgentWorkflowRepository.CommitStatus.APPLIED) {
+            service.publishCommitted(outcome.events());
+        }
     }
 
     private boolean cancelled(AgentWorkflowRepository.TaskData task) {
         return repository.findById(task.hospitalId(), task.id())
                 .map(current -> current.cancelRequested() || "CANCELLED".equals(current.status()))
                 .orElse(true);
+    }
+
+    private boolean renewClaim(AgentWorkflowRepository.ClaimHandle claim) {
+        Instant heartbeatAt = clock.instant();
+        return repository.heartbeat(
+                claim, heartbeatAt.plus(leaseDuration), heartbeatAt);
     }
 
     private String contextualIdea(AgentWorkflowService.TaskInput input) {
@@ -648,6 +878,15 @@ public class AgentWorkflowWorker {
 
     private Map<String, String> answers(AgentWorkflowService.TaskInput input) {
         return input.clarificationAnswers() == null ? Map.of() : input.clarificationAnswers();
+    }
+
+    private String sha256(String value) {
+        try {
+            return HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256")
+                    .digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (Exception exception) {
+            throw new IllegalStateException("研究方向候选集哈希失败", exception);
+        }
     }
 
     private String write(Object value) {

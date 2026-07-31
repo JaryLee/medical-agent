@@ -44,7 +44,9 @@ public class AgentWorkflowController {
     @PostMapping("/{taskId}/confirm-direction")
     public ApiResponse<AgentWorkflowService.TaskView> confirm(
             @PathVariable UUID taskId, @Valid @RequestBody ConfirmDirectionRequest request) {
-        return ApiResponse.ok(service.confirm(taskId, request.directionId()));
+        return ApiResponse.ok(service.confirm(
+                taskId, request.directionId(),
+                request.candidateSetId(), request.candidateSetHash()));
     }
 
     @PostMapping("/{taskId}/clarifications")
@@ -110,7 +112,10 @@ public class AgentWorkflowController {
             @NotNull UUID projectId,
             @NotBlank @Size(max = 2000) String idea) {}
 
-    public record ConfirmDirectionRequest(@NotBlank String directionId) {}
+    public record ConfirmDirectionRequest(
+            @NotBlank String directionId,
+            @NotNull UUID candidateSetId,
+            @NotBlank @Size(min = 64, max = 64) String candidateSetHash) {}
     public record ClarificationRequest(@NotEmpty Map<String, String> answers) {}
     public record ConfirmSearchStrategyRequest(
             @NotBlank @Size(max = 4000) String pubmedQuery) {}

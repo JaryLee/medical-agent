@@ -1,6 +1,7 @@
 package com.jarylee.medicalagent.agent.deepseek;
 
 import com.jarylee.medicalagent.agent.model.LogicalModelType;
+import com.jarylee.medicalagent.agent.model.ModelRoute;
 import com.jarylee.medicalagent.agent.model.ModelRouter;
 import com.jarylee.medicalagent.agent.model.ResearchModel;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -18,5 +19,15 @@ public class DeepSeekModelRouter implements ModelRouter {
     @Override
     public ResearchModel route(LogicalModelType logicalModelType) {
         return model;
+    }
+
+    @Override
+    public ModelRoute resolve(LogicalModelType logicalModelType) {
+        return new ModelRoute(
+                logicalModelType,
+                model,
+                "deepseek-single-route/v1",
+                "LEGACY_DEEPSEEK_SINGLE_MODEL",
+                ModelRoute.Pricing.unpriced());
     }
 }

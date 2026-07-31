@@ -27,7 +27,8 @@ public class StrobeCompletenessService {
     public static final String SOURCE_REFERENCE =
             "https://www.strobe-statement.org/checklists/";
     public static final String DISCLAIMER =
-            "自动预检查，不能替代医学、统计学或科研管理专家审核。"
+            "仅供科研设计讨论，未经伦理和科研管理审批。"
+                    + "自动预检查，不能替代医学、统计学或科研管理专家审核。"
                     + "STROBE 仅用于报告完整性检查，不是研究质量评分工具。";
 
     private final StrobeCompletenessRepository repository;

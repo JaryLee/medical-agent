@@ -45,6 +45,7 @@ import {
   type DocumentTemplate,
   type ExpertReview,
   type ExpertReviewCommentType,
+  type ExpertReviewResponsibility,
   type ModelRuntime,
   type Project,
   type ProjectMember,
@@ -84,6 +85,7 @@ const reviewTargetType = ref<'SECTION' | 'STROBE'>('SECTION')
 const reviewSectionId = ref('')
 const reviewStrobeItemId = ref('')
 const reviewCommentType = ref<ExpertReviewCommentType>('GENERAL')
+const reviewResponsibility = ref<ExpertReviewResponsibility>('MEDICAL_REVIEW')
 const reviewComment = ref('')
 const reviewDecisionSummary = ref('')
 const documentTemplates = ref<DocumentTemplate[]>([])
@@ -236,6 +238,10 @@ function connectAgentEvents(taskId: string) {
     'STROBE_COMPLETENESS_CHECKED',
     'EXPERT_REVIEW_REQUIRED',
     'EXPERT_REVIEW_COMMENT_ADDED',
+    'MEDICAL_REVIEW_APPROVED',
+    'STATISTICAL_REVIEW_APPROVED',
+    'MEDICAL_REVIEW_RETURNED',
+    'STATISTICAL_REVIEW_RETURNED',
     'EXPERT_APPROVED',
     'RETURNED_FOR_REVISION',
     'EXPERT_REVIEW_COMPLETED',
@@ -348,7 +354,18 @@ function openEventStream(taskId: string) {
 
 async function confirmDirection(directionId: string) {
   if (!agentTask.value) return
-  agentTask.value = await confirmAgentDirection(agentTask.value.id, directionId)
+  const candidateSetId = agentTask.value.output?.candidateSetId
+  const candidateSetHash = agentTask.value.output?.candidateSetHash
+  if (!candidateSetId || !candidateSetHash) {
+    ElMessage.error('研究方向候选集已变化，请刷新后重新确认')
+    return
+  }
+  agentTask.value = await confirmAgentDirection(
+    agentTask.value.id,
+    directionId,
+    candidateSetId,
+    candidateSetHash,
+  )
   connectAgentEvents(agentTask.value.id)
 }
 
@@ -422,6 +439,7 @@ async function addReviewComment() {
       strobeItemResultId:
         reviewTargetType.value === 'STROBE' ? reviewStrobeItemId.value : undefined,
       commentType: reviewCommentType.value,
+      responsibility: reviewResponsibility.value,
       content: reviewComment.value,
     })
     reviewComment.value = ''
@@ -436,13 +454,16 @@ async function decideReview(decision: 'APPROVE' | 'RETURN_FOR_REVISION') {
   try {
     expertReview.value = await submitExpertReviewDecision(
       agentTask.value.id,
+      reviewResponsibility.value,
       decision,
       reviewDecisionSummary.value,
       expertReview.value.version,
     )
     setAgentTask(await getAgentTask(agentTask.value.id))
     ElMessage.success(
-      decision === 'APPROVE' ? '专家审核已通过，等待课题负责人确认' : '方案已退回修改',
+      decision === 'APPROVE'
+        ? '本职责审核已通过；两类专家都通过后才能由课题负责人确认'
+        : '方案已退回修改',
     )
   } catch {
     ElMessage.error('审核决定提交失败；退回修改前必须至少添加一条定位批注')
@@ -1726,7 +1747,7 @@ async function refreshAudits() {
             STEP17 专家审核工作台
           </el-divider>
           <el-alert
-            title="审核结论由有权限的专家作出；专家通过后仍需课题负责人确认，确认时锁定当前章节版本。"
+            title="医学审核、统计审核和课题负责人确认必须由三个不同账号完成；内容变化会自动开启新轮次并使旧结论失效。"
             type="warning"
             :closable="false"
             show-icon
@@ -1742,15 +1763,25 @@ async function refreshAudits() {
             <el-descriptions-item label="审核版本">
               {{ expertReview.version }}
             </el-descriptions-item>
+            <el-descriptions-item label="审核轮次">
+              {{ expertReview.reviewRoundNo }}
+            </el-descriptions-item>
             <el-descriptions-item label="章节已锁定">
               {{ expertReview.sectionsLocked ? '是' : '否' }}
             </el-descriptions-item>
             <el-descriptions-item
               v-if="expertReview.expertSummary"
-              label="专家结论"
-              :span="3"
+              label="医学审核结论"
+              :span="2"
             >
               {{ expertReview.expertSummary }}
+            </el-descriptions-item>
+            <el-descriptions-item
+              v-if="expertReview.statisticalSummary"
+              label="统计审核结论"
+              :span="2"
+            >
+              {{ expertReview.statisticalSummary }}
             </el-descriptions-item>
           </el-descriptions>
 
@@ -1760,6 +1791,19 @@ async function refreshAudits() {
           >
             <h4>添加版本化专家批注</h4>
             <div class="form-grid">
+              <el-select
+                v-model="reviewResponsibility"
+                aria-label="审核职责"
+              >
+                <el-option
+                  label="医学审核"
+                  value="MEDICAL_REVIEW"
+                />
+                <el-option
+                  label="统计审核"
+                  value="STATISTICAL_REVIEW"
+                />
+              </el-select>
               <el-select
                 v-model="reviewTargetType"
                 aria-label="批注目标类型"
@@ -1831,7 +1875,7 @@ async function refreshAudits() {
               type="primary"
               @click="addReviewComment"
             >
-              保存专家批注
+              保存{{ reviewResponsibility === 'MEDICAL_REVIEW' ? '医学' : '统计' }}审核批注
             </el-button>
 
             <h4>提交专家审核决定</h4>
@@ -1854,7 +1898,7 @@ async function refreshAudits() {
               type="success"
               @click="decideReview('APPROVE')"
             >
-              专家审核通过
+              {{ reviewResponsibility === 'MEDICAL_REVIEW' ? '医学' : '统计' }}审核通过
             </el-button>
           </section>
 
@@ -1878,7 +1922,10 @@ async function refreshAudits() {
             shadow="never"
             class="strategy-limit"
           >
-            <el-tag>{{ comment.commentType }}</el-tag>
+            <el-tag>{{ comment.responsibility }}</el-tag>
+            <el-tag type="info">
+              第 {{ comment.reviewRoundNo }} 轮 · {{ comment.commentType }}
+            </el-tag>
             <span v-if="comment.protocolSectionId">
               章节 {{ comment.protocolSectionId }} · v{{ comment.protocolSectionVersionNo }}
             </span>
@@ -1896,7 +1943,7 @@ async function refreshAudits() {
               :key="action.id"
               :timestamp="formatTime(action.occurredAt)"
             >
-              <strong>{{ action.actionType }}</strong>
+              <strong>第 {{ action.reviewRoundNo }} 轮 · {{ action.actionType }}</strong>
               <p v-if="action.summary">
                 {{ action.summary }}
               </p>

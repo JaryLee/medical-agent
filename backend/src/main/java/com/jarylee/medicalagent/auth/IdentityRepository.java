@@ -14,7 +14,9 @@ public interface IdentityRepository {
 
     Optional<UserData> findUser(UUID hospitalId, String username);
     Optional<UserData> findUserById(UUID id);
+    Optional<UserData> findUserById(UUID hospitalId, UUID id);
     List<UserData> findUsers();
+    List<UserData> findUsers(UUID hospitalId);
     void insertUser(UserData user);
     void updateUserState(UserData user);
 

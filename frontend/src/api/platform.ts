@@ -26,6 +26,7 @@ export interface ModelRuntime {
 
 export interface Project {
   id: string
+  projectKey: string
   code: string
   name: string
   version: number
@@ -70,6 +71,8 @@ export type ExpertReviewCommentType =
   | 'REPORTING'
   | 'GENERAL'
 
+export type ExpertReviewResponsibility = 'MEDICAL_REVIEW' | 'STATISTICAL_REVIEW'
+
 export interface ExpertReview {
   reviewTaskId: string
   projectId: string
@@ -81,12 +84,18 @@ export interface ExpertReview {
     | 'EXPERT_APPROVED'
     | 'REVISION_REQUIRED'
     | 'APPROVED'
+    | 'SUPERSEDED'
+  reviewRoundNo: number
   submittedBy: string
   submittedAt: string
   expertReviewerId?: string
   expertDecision?: 'APPROVE' | 'RETURN_FOR_REVISION'
   expertSummary?: string
   expertDecidedAt?: string
+  statisticalReviewerId?: string
+  statisticalDecision?: 'APPROVE' | 'RETURN_FOR_REVISION'
+  statisticalSummary?: string
+  statisticalDecidedAt?: string
   ownerConfirmedBy?: string
   ownerConfirmedAt?: string
   sectionsLocked: boolean
@@ -97,6 +106,8 @@ export interface ExpertReview {
     protocolSectionVersionNo?: number
     strobeItemResultId?: string
     commentType: ExpertReviewCommentType
+    responsibility: ExpertReviewResponsibility | 'LEGACY'
+    reviewRoundNo: number
     content: string
     createdBy: string
     createdAt: string
@@ -104,6 +115,7 @@ export interface ExpertReview {
   history: Array<{
     id: string
     actionType: string
+    reviewRoundNo: number
     actorUserId?: string
     summary?: string
     occurredAt: string
@@ -188,9 +200,14 @@ export interface AgentTask {
     idea: string
     clarificationAnswers?: Record<string, string>
     directionId?: string
+    directionCandidateSetId?: string
+    directionCandidateSetHash?: string
   }
   output?: {
     clarificationQuestions?: string[]
+    candidateSetId?: string
+    candidateSetHash?: string
+    candidateSetSchemaVersion?: string
     directions?: Array<{
       id: string
       title: string
@@ -723,10 +740,15 @@ export async function listAgentTasks(projectId: string) {
   return response.data.data
 }
 
-export async function confirmAgentDirection(taskId: string, directionId: string) {
+export async function confirmAgentDirection(
+  taskId: string,
+  directionId: string,
+  candidateSetId: string,
+  candidateSetHash: string,
+) {
   const response = await client.post<ApiResponse<AgentTask>>(
     `/agent/tasks/${taskId}/confirm-direction`,
-    { directionId },
+    { directionId, candidateSetId, candidateSetHash },
   )
   return response.data.data
 }
@@ -784,6 +806,7 @@ export async function addExpertReviewComment(
     protocolSectionVersionNo?: number
     strobeItemResultId?: string
     commentType: ExpertReviewCommentType
+    responsibility: ExpertReviewResponsibility
     content: string
   },
 ) {
@@ -796,13 +819,14 @@ export async function addExpertReviewComment(
 
 export async function submitExpertReviewDecision(
   taskId: string,
+  responsibility: ExpertReviewResponsibility,
   decision: 'APPROVE' | 'RETURN_FOR_REVISION',
   summary: string,
   expectedVersion: number,
 ) {
   const response = await client.post<ApiResponse<ExpertReview>>(
     `/agent/tasks/${taskId}/expert-review/decision`,
-    { decision, summary, expectedVersion },
+    { responsibility, decision, summary, expectedVersion },
   )
   return response.data.data
 }

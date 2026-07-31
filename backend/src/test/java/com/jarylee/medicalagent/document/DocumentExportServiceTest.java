@@ -4,11 +4,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.jarylee.medicalagent.audit.AuditService;
 import com.jarylee.medicalagent.audit.MemoryAuditRepository;
 import com.jarylee.medicalagent.auth.*;
+import com.jarylee.medicalagent.common.BusinessException;
 import com.jarylee.medicalagent.file.MemoryObjectStorage;
 import com.jarylee.medicalagent.infrastructure.PlatformStore;
 import com.jarylee.medicalagent.research.*;
 import com.jarylee.medicalagent.review.ExpertReviewRepository;
 import com.jarylee.medicalagent.review.MemoryExpertReviewRepository;
+import com.jarylee.medicalagent.review.ReviewContentHash;
 import com.jarylee.medicalagent.workflow.AgentEventStream;
 import com.jarylee.medicalagent.workflow.AgentWorkflowRepository;
 import com.jarylee.medicalagent.workflow.MemoryAgentWorkflowRepository;
@@ -28,6 +30,7 @@ import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 class DocumentExportServiceTest {
     private final PlatformStore store = new PlatformStore();
@@ -171,8 +174,11 @@ class DocumentExportServiceTest {
                 null, null, now, now, null), "docx-task");
         reviews.create(new ExpertReviewRepository.ReviewTaskData(
                 reviewId, hospitalId, project.id(), taskId, protocolId,
-                strobeId, "APPROVED", ownerId, now, UUID.randomUUID(),
-                "APPROVE", "通过", now, ownerId, now, true, 2));
+                strobeId, "APPROVED", 1, ReviewContentHash.sha256(json, output), false,
+                ownerId, now, UUID.randomUUID(),
+                "APPROVE", "医学审核通过", now, UUID.randomUUID(),
+                "APPROVE", "统计审核通过", now,
+                ownerId, now, true, 3));
 
         var exported = service.confirmAndExport(
                 taskId, published.id(), publishedStyle.id(), true);
@@ -184,10 +190,20 @@ class DocumentExportServiceTest {
         assertThat(exported.citationStyleVersion())
                 .isEqualTo("HOSPITAL_GBT/v1");
         assertThat(exported.contentSha256()).hasSize(64);
+        assertThat(exported.fileName()).endsWith("-科研草案.docx");
         assertThat(workflows.findById(hospitalId, taskId).orElseThrow().status())
                 .isEqualTo("COMPLETED");
         var download = service.download(exported.id());
         assertThat(download.sha256()).isEqualTo(exported.contentSha256());
+        currentUser.user = new AuthenticatedUser(
+                UUID.randomUUID(), UUID.randomUUID(), "outside-doctor",
+                Set.of(Role.DOCTOR), false);
+        assertThatThrownBy(() -> service.download(exported.id()))
+                .isInstanceOf(BusinessException.class)
+                .hasMessage("文档导出记录不存在");
+        currentUser.user = new AuthenticatedUser(
+                ownerId, hospitalId, "owner",
+                Set.of(Role.DOCTOR, Role.HOSPITAL_ADMIN), false);
         String qaPath = System.getProperty("exportQaPath", "");
         if (!qaPath.isBlank()) {
             var path = java.nio.file.Path.of(qaPath).toAbsolutePath();
@@ -203,10 +219,24 @@ class DocumentExportServiceTest {
                     .map(value -> value.getText())
                     .reduce("", (left, right) -> left + "\n" + right);
             assertThat(text + tableText)
+                    .contains(ResearchDraftDocxMarker.DRAFT_LABEL)
+                    .contains(ResearchDraftDocxMarker.DISCLAIMER)
                     .contains("匿名队列研究方案")
                     .contains("[J]")
                     .contains("PMID:123")
                     .doesNotContain("${");
+            String headerText = document.getHeaderList().stream()
+                    .flatMap(header -> header.getParagraphs().stream())
+                    .map(value -> value.getText())
+                    .reduce("", (left, right) -> left + "\n" + right);
+            assertThat(headerText)
+                    .contains(ResearchDraftDocxMarker.DISCLAIMER);
+            assertThat(document.getProperties().getCoreProperties()
+                    .getTitle())
+                    .isEqualTo(ResearchDraftDocxMarker.DRAFT_LABEL);
+            assertThat(document.getProperties().getCoreProperties()
+                    .getSubject())
+                    .isEqualTo(ResearchDraftDocxMarker.DISCLAIMER);
             assertThat(document.getTables().getLast().getRows()).hasSize(2);
         }
     }

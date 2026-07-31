@@ -30,8 +30,9 @@ public class JdbcIdentityRepository implements IdentityRepository {
 
     @Override
     public Optional<HospitalData> findHospitalByCode(String code) {
-        return jdbc.sql("select id,code,name,created_at from hospital where lower(code)=lower(:code)")
-                .param("code", code).query(this::mapHospital).optional();
+        return jdbc.sql("select id,code,name,created_at from hospital where code=:code")
+                .param("code", IdentityNormalizer.hospitalCode(code))
+                .query(this::mapHospital).optional();
     }
 
     @Override
@@ -50,7 +51,8 @@ public class JdbcIdentityRepository implements IdentityRepository {
     public void insertHospital(HospitalData hospital) {
         try {
             jdbc.sql("insert into hospital(id,code,name,created_at) values(:id,:code,:name,:createdAt)")
-                    .params(Map.of("id", hospital.id(), "code", hospital.code(),
+                    .params(Map.of("id", hospital.id(),
+                            "code", IdentityNormalizer.hospitalCode(hospital.code()),
                             "name", hospital.name(), "createdAt", Timestamp.from(hospital.createdAt()))).update();
         } catch (DataIntegrityViolationException exception) {
             throw BusinessException.conflict("医院编码已存在");
@@ -61,9 +63,10 @@ public class JdbcIdentityRepository implements IdentityRepository {
     public Optional<UserData> findUser(UUID hospitalId, String username) {
         String hospitalPredicate = hospitalId == null ? "u.hospital_id is null" : "u.hospital_id=:hospitalId";
         var query = jdbc.sql(USER_SELECT + """
-                where %s and lower(u.username)=lower(:username)
+                where %s and u.username_normalized=:username
                 group by u.id
-                """.formatted(hospitalPredicate)).param("username", username);
+                """.formatted(hospitalPredicate))
+                .param("username", IdentityNormalizer.usernameLookup(username));
         if (hospitalId != null) query = query.param("hospitalId", hospitalId);
         return query.query(this::mapUser).optional();
     }
@@ -75,13 +78,42 @@ public class JdbcIdentityRepository implements IdentityRepository {
     }
 
     @Override
+    public Optional<UserData> findUserById(UUID hospitalId, UUID id) {
+        return jdbc.sql(USER_SELECT + """
+                where u.hospital_id=:hospitalId and u.id=:id
+                group by u.id
+                """)
+                .param("hospitalId", hospitalId)
+                .param("id", id)
+                .query(this::mapUser)
+                .optional();
+    }
+
+    @Override
     public List<UserData> findUsers() {
         return jdbc.sql(USER_SELECT + " group by u.id order by u.username").query(this::mapUser).list();
     }
 
     @Override
+    public List<UserData> findUsers(UUID hospitalId) {
+        return jdbc.sql(USER_SELECT + """
+                where u.hospital_id=:hospitalId
+                group by u.id
+                order by u.username
+                """)
+                .param("hospitalId", hospitalId)
+                .query(this::mapUser)
+                .list();
+    }
+
+    @Override
     @Transactional
     public void insertUser(UserData user) {
+        UserData canonical = new UserData(
+                user.id(), user.hospitalId(),
+                IdentityNormalizer.username(user.username()),
+                user.passwordHash(), user.roles(), user.enabled(),
+                user.forcePasswordChange(), user.failedAttempts(), user.lockedUntil());
         try {
             jdbc.sql("""
                     insert into platform_user(
@@ -89,10 +121,10 @@ public class JdbcIdentityRepository implements IdentityRepository {
                         failed_login_attempts,locked_until
                     ) values(:id,:hospitalId,:username,:passwordHash,:enabled,:forcePasswordChange,
                              :failedAttempts,:lockedUntil)
-                    """).params(params(user)).update();
-            for (Role role : user.roles()) {
+                    """).params(params(canonical)).update();
+            for (Role role : canonical.roles()) {
                 jdbc.sql("insert into user_role(user_id,role_code) values(:userId,:role)")
-                        .params(Map.of("userId", user.id(), "role", role.name())).update();
+                        .params(Map.of("userId", canonical.id(), "role", role.name())).update();
             }
         } catch (DataIntegrityViolationException exception) {
             throw BusinessException.conflict("本院用户名已存在");

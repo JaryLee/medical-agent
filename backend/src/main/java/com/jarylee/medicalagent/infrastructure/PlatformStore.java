@@ -45,13 +45,16 @@ public class PlatformStore {
     public static final class ProjectRow {
         public final UUID id;
         public final UUID hospitalId;
+        public final String projectKey;
         public final String code;
         public String name;
         public long version;
 
-        public ProjectRow(UUID id, UUID hospitalId, String code, String name) {
+        public ProjectRow(
+                UUID id, UUID hospitalId, String projectKey, String code, String name) {
             this.id = id;
             this.hospitalId = hospitalId;
+            this.projectKey = projectKey;
             this.code = code;
             this.name = name;
         }

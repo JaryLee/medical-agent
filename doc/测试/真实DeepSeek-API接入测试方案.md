@@ -138,6 +138,17 @@ backend/target/medical-agent-deepseek-live.jar
 
 动态标识避免并行或重复执行时发生唯一键冲突。
 
+### 5.4 当前 8080 固定人工测试账号
+
+为方便在当前本地页面手工复验，PostgreSQL 中另有一个固定的合成测试账号：
+
+| 医院编码 | 用户名 | 角色 | 首次改密 | 数据域 |
+| --- | --- | --- | --- | --- |
+| `DEEPSEEK-TEST` | `deepseek-doctor` | `DOCTOR`、`HOSPITAL_ADMIN` | 否 | 当前 8080 / PostgreSQL |
+
+该记录与 18080 memory 套件中的同名用户不是同一用户 ID，也不共享医院、密码或会话。固定密码
+不写入仓库文档；配置或重置账号时会撤销旧会话并记录 `LOCAL_TEST_ACCOUNT_UPSERT` 审计。
+
 ## 6. 测试数据
 
 ### 6.1 合成研究想法
@@ -452,7 +463,8 @@ TestData=SYNTHETIC_ANONYMOUS
 模型：deepseek · deepseek-v4-flash · 真 API
 ```
 
-当前 8080 的验证不得复用 18080 的测试用户；两套数据域完全独立。
+当前 8080 和 18080 可以使用相同用户名便于识别，但它们是不同数据域中的独立记录，不共享
+用户 ID、医院、密码或会话。
 
 ## 11. 证据与产物
 
@@ -625,6 +637,8 @@ Token 泄露检查：
 3. 旧脚本在 Windows 上可能因 8080 锁定默认 JAR 而无法重新打包；现改用独立测试 JAR。
 4. 固定测试密码已改为每次随机生成，并通过环境变量传给后端和 Playwright。
 5. 脚本结束后恢复调用前的环境变量，不污染开发终端。
+6. 当前 PostgreSQL 已创建固定人工测试账号 `DEEPSEEK-TEST / deepseek-doctor`，角色和登录
+   状态经 8080 验证通过；验证会话随后撤销。
 
 ## 17. 后续扩展
 

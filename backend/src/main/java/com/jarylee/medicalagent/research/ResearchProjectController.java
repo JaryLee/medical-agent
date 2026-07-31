@@ -27,9 +27,15 @@ public class ResearchProjectController {
         return ApiResponse.ok(service.list());
     }
 
-    @GetMapping("/{id}")
+    @GetMapping("/legacy/{id}")
     public ApiResponse<ResearchProjectService.ProjectView> get(@PathVariable UUID id) {
         return ApiResponse.ok(service.get(id));
+    }
+
+    @GetMapping("/{projectKey}")
+    public ApiResponse<ResearchProjectService.PublicProjectView> getByKey(
+            @PathVariable String projectKey) {
+        return ApiResponse.ok(service.getByKey(projectKey));
     }
 
     @PutMapping("/{id}")
